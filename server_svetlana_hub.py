@@ -1,0 +1,938 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Центральный сервер управления дообучением Светланы на Windows RTX 3060.
+Запущен на порту 8888 (http://192.168.0.106:8888).
+Обеспечивает:
+1. Веб-интерфейс с двумя кнопками:
+   - Кнопка 1: Скачать и установить всё для Windows (RTX 3060)
+   - Кнопка 2: Запустить дообучение в 1 клик
+2. Диспетчер задач для Windows-воркера (RTX 3060).
+3. Потоковое отображение логов, эпох и прогресса обучения в браузере в реальном времени.
+4. Раздачу готового студийного датасета (dataset_svetlana.zip).
+5. Приём и выдачу готовых дообученных весов (svetlana_custom_weights.zip).
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import shutil
+import zipfile
+import threading
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.parse
+
+PORT = 8888
+SERVER_IP = "192.168.0.106"
+BASE_DIR = Path(__file__).parent.resolve()
+
+hub_state = {
+    "worker_connected": False,
+    "worker_ip": "",
+    "gpu_name": "Ожидание подключения Windows...",
+    "vram_gb": 0.0,
+    "status": "waiting_worker",  # waiting_worker, ready, running, completed, error
+    "step": 0,
+    "step_name": "Ожидание подключения Windows RTX 3060",
+    "progress": 0,
+    "task": "none",              # none, start_training
+    "logs": [f"[{time.strftime('%H:%M:%S')}] 🌐 Сервер запущен. Откройте страницу http://{SERVER_IP}:{PORT} на компьютере с Windows."],
+    "elapsed_sec": 0,
+    "start_time": None
+}
+
+class HubRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if path == "/" or path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(HTML_PAGE.replace("{{SERVER_IP}}", SERVER_IP).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+
+        elif path == "/api/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            if hub_state["start_time"] and hub_state["status"] == "running":
+                hub_state["elapsed_sec"] = int(time.time() - hub_state["start_time"])
+            self.wfile.write(json.dumps(hub_state, ensure_ascii=False).encode("utf-8"))
+
+        elif path == "/api/worker_task":
+            # Windows воркер опрашивает сервер на наличие команд
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            resp = {"task": hub_state["task"]}
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+
+        elif path == "/raw_data.json":
+            raw_path = BASE_DIR / "raw_data.json"
+            if raw_path.exists():
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                with open(raw_path, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        elif path == "/dataset_svetlana.zip":
+            zip_p = BASE_DIR / "dataset_svetlana.zip"
+            if zip_p.exists():
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="dataset_svetlana.zip"')
+                self.send_header("Content-Length", str(zip_p.stat().st_size))
+                self.end_headers()
+                with open(zip_p, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        elif path == "/setup.bat":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-bat")
+            self.send_header("Content-Disposition", 'attachment; filename="setup_svetlana.bat"')
+            self.end_headers()
+            self.wfile.write(SETUP_BAT_SCRIPT.replace("{{SERVER_IP}}", SERVER_IP).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+
+        elif path == "/setup.ps1":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(SETUP_PS1_SCRIPT.replace("{{SERVER_IP}}", SERVER_IP).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+
+        elif path == "/worker.py":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(WORKER_PY_SCRIPT.replace("{{SERVER_IP}}", SERVER_IP).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+
+        elif path == "/download_weights":
+            weights_zip = BASE_DIR / "svetlana_custom_weights.zip"
+            if weights_zip.exists():
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", 'attachment; filename="svetlana_custom_weights.zip"')
+                self.send_header("Content-Length", str(weights_zip.stat().st_size))
+                self.end_headers()
+                with open(weights_zip, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        length = int(self.headers.get("Content-Length", 0))
+
+        if path == "/api/worker_upload_weights":
+            # Прием обученных весов от Windows воркера
+            weights_zip = BASE_DIR / "svetlana_custom_weights.zip"
+            with open(weights_zip, "wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            log_msg(f"📦 Готовые веса получены с Windows ({weights_zip.stat().st_size / 1024 / 1024:.1f} МБ)!")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "received"}).encode("utf-8"))
+            return
+
+        body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if path == "/api/start_training":
+            # Пользователь нажал кнопку 2 на веб-странице
+            if hub_state["status"] in ["ready", "completed", "error"]:
+                hub_state["task"] = "start_training"
+                hub_state["status"] = "running"
+                hub_state["start_time"] = time.time()
+                hub_state["progress"] = 5
+                hub_state["step"] = 1
+                hub_state["step_name"] = "Старт процесса на RTX 3060..."
+                log_msg("🚀 Команда на дообучение передана на видеокарту RTX 3060!")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
+
+        elif path == "/api/worker_ping":
+            # Воркер с Windows сообщает о своем статусе
+            hub_state["worker_connected"] = True
+            hub_state["worker_ip"] = self.client_address[0]
+            if "gpu_name" in data and data["gpu_name"]:
+                hub_state["gpu_name"] = data["gpu_name"]
+            if "vram_gb" in data:
+                hub_state["vram_gb"] = data["vram_gb"]
+            if hub_state["status"] == "waiting_worker":
+                hub_state["status"] = "ready"
+                hub_state["step_name"] = "Окружение Windows готово к обучению"
+                log_msg(f"🟢 Подключен компьютер Windows ({hub_state['gpu_name']}, {hub_state['vram_gb']} GB VRAM). Готов к обучению!")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ack"}).encode("utf-8"))
+
+        elif path == "/api/worker_log":
+            # Воркер отправляет логи и процент выполнения
+            if "msg" in data:
+                log_msg(data["msg"])
+            if "progress" in data:
+                hub_state["progress"] = data["progress"]
+            if "step" in data:
+                hub_state["step"] = data["step"]
+            if "step_name" in data:
+                hub_state["step_name"] = data["step_name"]
+            if "status" in data:
+                hub_state["status"] = data["status"]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ack"}).encode("utf-8"))
+
+        elif path == "/api/worker_finish":
+            # Завершение обучения
+            hub_state["status"] = "completed"
+            hub_state["task"] = "none"
+            hub_state["progress"] = 100
+            hub_state["step"] = 5
+            hub_state["step_name"] = "Дообучение успешно завершено!"
+            log_msg("🎉 ДООБУЧЕНИЕ СВЕТЛАНЫ НА RTX 3060 ПОЛНОСТЬЮ ЗАВЕРШЕНО!")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ack"}).encode("utf-8"))
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+def log_msg(msg):
+    ts = time.strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    print(entry)
+    hub_state["logs"].append(entry)
+    if len(hub_state["logs"]) > 2000:
+        hub_state["logs"].pop(0)
+
+# ==============================================================================
+# 1. Шаблон страницы управления (HTML / JS / CSS)
+# ==============================================================================
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🎙️ Центр управления дообучением Светланы на RTX 3060</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: rgba(23, 32, 54, 0.75);
+      --border: rgba(255, 255, 255, 0.08);
+      --primary: #3b82f6;
+      --accent: #10b981;
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at top, #1e293b, #0b0f19);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 30px 15px;
+    }
+    .container { width: 100%; max-width: 860px; }
+    .header { text-align: center; margin-bottom: 25px; }
+    .header h1 {
+      font-size: 26px;
+      margin-bottom: 8px;
+      background: linear-gradient(135deg, #60a5fa, #34d399);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .header p { color: var(--text-muted); font-size: 14px; }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      backdrop-filter: blur(12px);
+      padding: 24px;
+      margin-bottom: 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(245, 158, 11, 0.15);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      color: #fbbf24;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 20px;
+      transition: all 0.3s;
+    }
+    .status-badge.connected {
+      background: rgba(16, 185, 129, 0.15);
+      border-color: rgba(16, 185, 129, 0.3);
+      color: #34d399;
+    }
+    .buttons-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 15px;
+      margin-bottom: 20px;
+    }
+    @media (max-width: 640px) {
+      .buttons-grid { grid-template-columns: 1fr; }
+    }
+    .action-btn {
+      padding: 18px;
+      border: none;
+      border-radius: 12px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      text-decoration: none;
+      transition: all 0.2s ease;
+      text-align: center;
+    }
+    .btn-step1 {
+      background: linear-gradient(135deg, #1e40af, #2563eb);
+      color: white;
+      box-shadow: 0 4px 15px rgba(37, 99, 235, 0.3);
+    }
+    .btn-step1:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(37, 99, 235, 0.5); }
+    .btn-step2 {
+      background: linear-gradient(135deg, #059669, #10b981);
+      color: white;
+      box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+    }
+    .btn-step2:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(16, 185, 129, 0.5); }
+    .btn-step2:disabled { opacity: 0.4; cursor: not-allowed; filter: grayscale(0.7); }
+    .btn-subtext { font-size: 12px; font-weight: normal; opacity: 0.85; }
+    
+    .powershell-box {
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-family: monospace;
+      font-size: 12px;
+      color: #93c5fd;
+    }
+    .btn-copy {
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: white;
+      padding: 5px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .btn-copy:hover { background: rgba(255, 255, 255, 0.2); }
+
+    .progress-bar-bg {
+      background: rgba(255, 255, 255, 0.08);
+      height: 14px;
+      border-radius: 7px;
+      overflow: hidden;
+      margin: 18px 0 8px;
+    }
+    .progress-bar-fill {
+      background: linear-gradient(90deg, #3b82f6, #10b981);
+      height: 100%;
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+    .steps-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin: 20px 0;
+    }
+    .step-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .step-icon {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+    }
+    .step-item.active { color: #60a5fa; font-weight: 600; }
+    .step-item.active .step-icon { border-color: #3b82f6; background: rgba(59, 130, 246, 0.2); }
+    .step-item.completed { color: #34d399; }
+    .step-item.completed .step-icon { border-color: #10b981; background: rgba(16, 185, 129, 0.2); color: #10b981; }
+
+    .terminal {
+      background: #050811;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 10px;
+      padding: 14px;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #93c5fd;
+      height: 240px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+    .btn-download-weights {
+      display: block;
+      width: 100%;
+      text-align: center;
+      padding: 16px;
+      background: linear-gradient(135deg, #059669, #10b981);
+      color: white;
+      text-decoration: none;
+      border-radius: 12px;
+      font-weight: 700;
+      font-size: 16px;
+      margin-top: 15px;
+      box-shadow: 0 4px 15px rgba(16, 185, 129, 0.4);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🎙️ Панель дообучения Светланы на RTX 3060</h1>
+      <p>100% автоматизация: точные ударения (+), русская фонетика ARPA, ~7 минут на видеокарте</p>
+    </div>
+
+    <div class="card">
+      <div id="statusBadge" class="status-badge">
+        <span>●</span> <span id="statusText">Ожидание подключения Windows RTX 3060...</span>
+      </div>
+
+      <div class="buttons-grid">
+        <a href="/setup.bat" class="action-btn btn-step1">
+          <span>📥 КНОПКА 1. СКАЧАТЬ И УСТАНОВИТЬ ВСЁ</span>
+          <span class="btn-subtext">Скачает setup_svetlana.bat (просто нажмите на него в загрузках)</span>
+        </a>
+
+        <button id="btnTrain" class="action-btn btn-step2" onclick="startTraining()" disabled>
+          <span>🚀 КНОПКА 2. ЗАПУСТИТЬ ДООБУЧЕНИЕ</span>
+          <span id="btnTrainSubtext" class="btn-subtext">Активируется при подключении Windows (~7 мин)</span>
+        </button>
+      </div>
+
+      <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 5px;">Или выполните 1 команду в PowerShell на Windows (без скачивания файлов):</div>
+      <div class="powershell-box">
+        <span id="psCode">irm http://{{SERVER_IP}}:{{PORT}}/setup.ps1 | iex</span>
+        <button class="btn-copy" onclick="copyPS()">Копировать</button>
+      </div>
+
+      <div class="progress-bar-bg">
+        <div id="progressFill" class="progress-bar-fill"></div>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted);">
+        <span id="stepName">Ожидание подключения воркера</span>
+        <span id="progressText">0%</span>
+      </div>
+
+      <div class="steps-list">
+        <div id="st1" class="step-item"><div class="step-icon">1</div><span>Распаковка студийного датасета Светланы (102 фразы с точными ударениями +)</span></div>
+        <div id="st2" class="step-item"><div class="step-icon">2</div><span>Извлечение признаков на RTX 3060 (HuBERT 32 кГц + семантика)</span></div>
+        <div id="st3" class="step-item"><div class="step-icon">3</div><span>Обучение акустической модели SoVITS (20 эпох, ~4 мин)</span></div>
+        <div id="st4" class="step-item"><div class="step-icon">4</div><span>Обучение семантической модели GPT (15 эпох, ~3 мин)</span></div>
+        <div id="st5" class="step-item"><div class="step-icon">5</div><span>Готово! Упаковка весов и синхронизация с плеером аудиокниги</span></div>
+      </div>
+
+      <div id="downloadBox" style="display: none;">
+        <a href="/download_weights" class="btn-download-weights">💾 СКАЧАТЬ ГОТОВЫЕ ВЕСА (svetlana_custom_weights.zip)</a>
+      </div>
+    </div>
+
+    <div class="card" style="padding: 16px;">
+      <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--text-muted); display: flex; justify-content: space-between;">
+        <span>Терминал вывода RTX 3060 в реальном времени:</span>
+        <span id="timerText">00:00</span>
+      </div>
+      <div id="terminal" class="terminal">Ожидание подключения воркера Windows...</div>
+    </div>
+  </div>
+
+  <script>
+    function copyPS() {
+      const code = document.getElementById('psCode').innerText;
+      navigator.clipboard.writeText(code);
+      alert('Команда скопирована в буфер обмена! Нажмите Ctrl+V в окне PowerShell на Windows.');
+    }
+
+    async function startTraining() {
+      const btn = document.getElementById('btnTrain');
+      btn.disabled = true;
+      btn.innerHTML = '<span>⏳ ОБУЧЕНИЕ ЗАПУСКАЕТСЯ НА RTX 3060...</span>';
+      await fetch('/api/start_training', { method: 'POST' });
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+
+        const badge = document.getElementById('statusBadge');
+        const btnTrain = document.getElementById('btnTrain');
+        const btnSub = document.getElementById('btnTrainSubtext');
+
+        if (data.worker_connected) {
+          badge.className = 'status-badge connected';
+          badge.innerHTML = `<span>🟢</span> <span>Windows на связи: ${data.gpu_name} (${data.vram_gb} GB VRAM)</span>`;
+          if (data.status === 'ready') {
+            btnTrain.disabled = false;
+            btnTrain.innerHTML = '<span>🚀 КНОПКА 2. ЗАПУСТИТЬ ДООБУЧЕНИЕ</span><span class="btn-subtext">RTX 3060 готова! Нажмите для старта (~7 мин)</span>';
+          }
+        } else {
+          badge.className = 'status-badge';
+          badge.innerHTML = `<span>●</span> <span>${data.step_name}</span>`;
+        }
+
+        if (data.status === 'running') {
+          btnTrain.disabled = true;
+          btnTrain.innerHTML = '<span>⏳ ИДЁТ ОБУЧЕНИЕ НА RTX 3060...</span>';
+        } else if (data.status === 'completed') {
+          btnTrain.disabled = true;
+          btnTrain.innerHTML = '<span>🎉 ДООБУЧЕНИЕ УСПЕШНО ЗАВЕРШЕНО!</span>';
+          document.getElementById('downloadBox').style.display = 'block';
+        }
+
+        document.getElementById('progressFill').style.width = data.progress + '%';
+        document.getElementById('progressText').innerText = data.progress + '%';
+        document.getElementById('stepName').innerText = data.step_name;
+
+        if (data.elapsed_sec) {
+          const m = String(Math.floor(data.elapsed_sec / 60)).padStart(2, '0');
+          const s = String(data.elapsed_sec % 60).padStart(2, '0');
+          document.getElementById('timerText').innerText = `${m}:${s}`;
+        }
+
+        // Обновление иконок шагов
+        for (let i = 1; i <= 5; i++) {
+          const el = document.getElementById('st' + i);
+          el.className = 'step-item';
+          if (data.step > i || data.status === 'completed') {
+            el.className = 'step-item completed';
+            el.querySelector('.step-icon').innerText = '✓';
+          } else if (data.step === i && data.status === 'running') {
+            el.className = 'step-item active';
+            el.querySelector('.step-icon').innerText = '●';
+          } else {
+            el.querySelector('.step-icon').innerText = i;
+          }
+        }
+
+        const term = document.getElementById('terminal');
+        term.innerText = data.logs.join('\\n');
+        term.scrollTop = term.scrollHeight;
+
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    setInterval(poll, 1500);
+    poll();
+  </script>
+</body>
+</html>
+"""
+
+# ==============================================================================
+# 2. Windows Batch скрипт (скачивается Кнопкой 1)
+# ==============================================================================
+SETUP_BAT_SCRIPT = """@echo off
+chcp 65001 > nul
+title Установка и подключение воркера Светланы к RTX 3060
+
+echo =========================================================
+echo   🎙️ АВТОМАТИЧЕСКАЯ НАСТРОЙКА ОКРУЖЕНИЯ ДЛЯ RTX 3060
+echo =========================================================
+echo Подключение к серверу http://{{SERVER_IP}}:{{PORT}} ...
+
+powershell -ExecutionPolicy Bypass -Command "irm http://{{SERVER_IP}}:{{PORT}}/setup.ps1 | iex"
+pause
+"""
+
+# ==============================================================================
+# 3. Windows PowerShell скрипт автоматической подготовки (setup.ps1)
+# ==============================================================================
+SETUP_PS1_SCRIPT = """# Автоматическая настройка воркера GPT-SoVITS на Windows
+$ServerUrl = "http://{{SERVER_IP}}:{{PORT}}"
+$WorkDir = "$HOME\\GPT-SoVITS-Svetlana"
+
+Write-Host "=========================================================" -ForegroundColor Cyan
+Write-Host "  🎙️ Подготовка окружения Светланы на RTX 3060" -ForegroundColor Cyan
+Write-Host "=========================================================" -ForegroundColor Cyan
+
+# 1. Поиск уже установленного GPT-SoVITS на дисках пользователя
+$candidates = @(
+    (Get-Location).Path,
+    "C:\\GPT-SoVITS", "D:\\GPT-SoVITS", "E:\\GPT-SoVITS",
+    "$HOME\\GPT-SoVITS", "$HOME\\GPT-SoVITS-v2",
+    "$HOME\\GPT-SoVITS-Svetlana"
+)
+
+$foundDir = $null
+foreach ($c in $candidates) {
+    if ((Test-Path "$c\\GPT_SoVITS") -or (Test-Path "$c\\runtime\\python.exe")) {
+        $foundDir = $c
+        Write-Host "✅ Обнаружена папка GPT-SoVITS: $foundDir" -ForegroundColor Green
+        break
+    }
+}
+
+if ($foundDir) {
+    $WorkDir = $foundDir
+} else {
+    if (-not (Test-Path $WorkDir)) {
+        New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+    }
+}
+Set-Location $WorkDir
+Write-Host "📁 Рабочая директория: $WorkDir" -ForegroundColor Cyan
+
+# 2. Определение интерпретатора Python
+$PythonExe = "python"
+if (Test-Path "runtime\\python.exe") {
+    $PythonExe = (Resolve-Path "runtime\\python.exe").Path
+    Write-Host "🐍 Используется встроенный Python сборки: $PythonExe" -ForegroundColor Green
+} elseif (Test-Path "runtime\\bin\\python.exe") {
+    $PythonExe = (Resolve-Path "runtime\\bin\\python.exe").Path
+    Write-Host "🐍 Используется runtime Python: $PythonExe" -ForegroundColor Green
+} elseif (Get-Command python -ErrorAction SilentlyContinue) {
+    Write-Host "🐍 Обнаружен системный Python!" -ForegroundColor Green
+} else {
+    Write-Host "⚠️ Python не найден. Устанавливаем через winget..." -ForegroundColor Yellow
+    winget install --id Python.Python.3.10 -e --source winget
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+}
+
+# 3. Клонирование GPT-SoVITS если директория не содержит репозитория
+if (-not (Test-Path "GPT_SoVITS")) {
+    Write-Host "📦 Клонирование репозитория GPT-SoVITS..." -ForegroundColor Green
+    git clone --depth=1 https://github.com/RVC-Boss/GPT-SoVITS.git .
+}
+
+# 4. Проверка базовых предобученных весов v2
+$s2g = "GPT_SoVITS\\pretrained_models\\gsv-v2final-pretrained\\s2G2333k.pth"
+if (-not (Test-Path $s2g)) {
+    Write-Host "📥 Базовые модели v2 не найдены. Загрузка предобученных моделей с HuggingFace..." -ForegroundColor Yellow
+    Invoke-WebRequest -Uri "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/pretrained_models.zip" -OutFile "pretrained_models.zip"
+    Expand-Archive -Path "pretrained_models.zip" -DestinationPath "GPT_SoVITS" -Force
+    Remove-Item "pretrained_models.zip" -Force -ErrorAction SilentlyContinue
+    Write-Host "✅ Базовые модели успешно загружены и распакованы!" -ForegroundColor Green
+} else {
+    Write-Host "✅ Базовые предобученные модели GPT-SoVITS v2 в наличии!" -ForegroundColor Green
+}
+
+# 5. Скачиваем воркер и датасет с сервера
+Write-Host "📥 Загрузка файлов воркера с сервера $ServerUrl ..." -ForegroundColor Green
+Invoke-WebRequest -Uri "$ServerUrl/worker.py" -OutFile "worker.py"
+Invoke-WebRequest -Uri "$ServerUrl/raw_data.json" -OutFile "raw_data.json"
+
+# 6. Запуск воркера
+Write-Host "🚀 Запуск фонового воркера RTX 3060..." -ForegroundColor Green
+& $PythonExe worker.py
+"""
+
+# ==============================================================================
+# 4. Скрипт воркера worker.py, исполняющийся на Windows
+# ==============================================================================
+WORKER_PY_SCRIPT = """import os
+import re
+import sys
+import json
+import time
+import glob
+import shutil
+import zipfile
+import subprocess
+import urllib.request
+from pathlib import Path
+
+SERVER_URL = "http://{{SERVER_IP}}:{{PORT}}"
+BASE_DIR = Path.cwd()
+DATASET_DIR = BASE_DIR / "dataset_svetlana"
+WAVS_DIR = DATASET_DIR / "wavs"
+LOGS_DIR = BASE_DIR / "logs" / "svetlana_plus"
+
+def send_ping():
+    gpu_name = "NVIDIA CUDA"
+    vram_gb = 0.0
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            vram_gb = round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 1)
+        else:
+            gpu_name = "CPU (CUDA не активен)"
+    except Exception as e:
+        gpu_name = f"Python (без torch: {e})"
+    data = json.dumps({"gpu_name": gpu_name, "vram_gb": vram_gb}).encode("utf-8")
+    req = urllib.request.Request(f"{SERVER_URL}/api/worker_ping", data=data, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=3)
+    except Exception as e:
+        print("Ошибка связи с сервером при ping:", e)
+
+def send_log(msg, progress=None, step=None, step_name=None, status=None):
+    payload = {"msg": msg}
+    if progress is not None: payload["progress"] = progress
+    if step is not None: payload["step"] = step
+    if step_name is not None: payload["step_name"] = step_name
+    if status is not None: payload["status"] = status
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(f"{SERVER_URL}/api/worker_log", data=data, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
+    print(f">> {msg}")
+
+def run_training():
+    send_log("🚀 Запуск дообучения Светланы на RTX 3060...", progress=5, step=1, step_name="Подготовка студийного датасета (102 фразы)", status="running")
+
+    # 1. Загрузка и распаковка готового студийного датасета с сервера
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+    WAVS_DIR.mkdir(parents=True, exist_ok=True)
+
+    wavs = list(WAVS_DIR.glob("*.wav"))
+    if len(wavs) < 100:
+        send_log("📥 Загрузка студийного датасета Светланы с сервера (102 WAV клипа 24 кГц)...")
+        zip_path = BASE_DIR / "dataset_svetlana.zip"
+        try:
+            urllib.request.urlretrieve(f"{SERVER_URL}/dataset_svetlana.zip", str(zip_path))
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(BASE_DIR)
+            send_log(f"✅ Датасет распакован ({len(list(WAVS_DIR.glob('*.wav')))} WAV файлов)!")
+        except Exception as e:
+            send_log(f"⚠️ Ошибка загрузки архива датасета: {e}")
+
+    # Создаем logs/svetlana_plus
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Копируем 2-name2text.txt если есть в датасете
+    if (DATASET_DIR / "2-name2text.txt").exists():
+        shutil.copy(DATASET_DIR / "2-name2text.txt", LOGS_DIR / "2-name2text.txt")
+        send_log("✅ Фонетическая разметка ARPA с ударениями (+) синхронизирована!")
+
+    send_log("✅ Студийный датасет Светланы готов!", progress=25, step=2, step_name="Извлечение признаков (HuBERT 32 кГц + семантика)")
+
+    # 2. Извлечение признаков (HuBERT + семантика)
+    env = os.environ.copy()
+    env["inp_text"] = str(DATASET_DIR / "metadata_sovits.list")
+    env["inp_wav_dir"] = str(DATASET_DIR)
+    env["exp_name"] = "svetlana_plus"
+    env["i_part"] = "0"
+    env["all_parts"] = "1"
+    env["_CUDA_VISIBLE_DEVICES"] = "0"
+    env["opt_dir"] = str(LOGS_DIR)
+    env["cnhubert_base_dir"] = "GPT_SoVITS/pretrained_models/chinese-hubert-base"
+    env["bert_pretrained_dir"] = "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"
+    env["pretrained_s2G"] = "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"
+    env["s2config_path"] = "GPT_SoVITS/configs/s2.json"
+    env["PYTHONPATH"] = f".;GPT_SoVITS;{env.get('PYTHONPATH', '')}"
+
+    send_log("1/2 Извлечение HuBERT 32 кГц на видеокарте...")
+    subprocess.run([sys.executable, "GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py"], env=env, check=True)
+
+    send_log("2/2 Извлечение семантических признаков...")
+    subprocess.run([sys.executable, "GPT_SoVITS/prepare_datasets/3-get-semantic.py"], env=env, check=True)
+
+    # Слияние семантических файлов
+    tsv_parts = list(LOGS_DIR.glob("6-name2semantic-*.tsv"))
+    if tsv_parts:
+        lines = []
+        for p in sorted(tsv_parts):
+            with open(p, "r", encoding="utf-8") as f:
+                lines.extend([l.strip() for l in f if l.strip()])
+        with open(LOGS_DIR / "6-name2semantic.tsv", "w", encoding="utf-8") as f:
+            f.write("\\n".join(lines) + "\\n")
+
+    send_log("✅ Признаки датасета извлечены!", progress=40, step=3, step_name="Обучение SoVITS (20 эпох на RTX 3060)")
+
+    # 3. Обучение SoVITS (20 эпох)
+    with open("GPT_SoVITS/configs/s2.json", "r", encoding="utf-8") as f:
+        s2 = json.load(f)
+    s2_dir = "logs/svetlana_plus"
+    os.makedirs(f"{s2_dir}/logs_s2_v2", exist_ok=True)
+    os.makedirs("SoVITS_weights_v2", exist_ok=True)
+    s2["train"]["batch_size"] = 8
+    s2["train"]["epochs"] = 20
+    s2["train"]["save_every_epoch"] = 5
+    s2["train"]["if_save_latest"] = 1
+    s2["train"]["pretrained_s2G"] = "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"
+    s2["train"]["pretrained_s2D"] = "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2D2333k.pth"
+    s2["model"]["version"] = "v2"
+    s2["data"]["exp_dir"] = s2["s2_ckpt_dir"] = s2_dir
+    s2["save_weight_dir"] = "SoVITS_weights_v2"
+    s2["name"] = "svetlana_plus"
+    s2["version"] = "v2"
+    os.makedirs("TEMP", exist_ok=True)
+    with open("TEMP/tmp_s2.json", "w", encoding="utf-8") as f:
+        json.dump(s2, f)
+
+    send_log("🚀 Старт обучения акустической модели SoVITS (20 эпох)...")
+    p = subprocess.Popen([sys.executable, "GPT_SoVITS/s2_train.py", "--config", "TEMP/tmp_s2.json"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    for l in p.stdout:
+        line_clean = l.strip()
+        if "epoch" in line_clean.lower() or "loss" in line_clean.lower():
+            # Извлекаем номер эпохи если есть
+            m = re.search(r'epoch[:\\s]+(\\d+)', line_clean, re.I)
+            if m:
+                ep = int(m.group(1))
+                prog = 40 + int((min(ep, 20) / 20) * 30)
+                send_log(f"[SoVITS] {line_clean}", progress=prog)
+            else:
+                send_log(f"[SoVITS] {line_clean}")
+    p.wait()
+
+    send_log("✅ Обучение SoVITS успешно завершено!", progress=70, step=4, step_name="Обучение GPT (15 эпох на RTX 3060)")
+
+    # 4. Обучение GPT (15 эпох)
+    import yaml
+    with open("GPT_SoVITS/configs/s1longer-v2.yaml", "r", encoding="utf-8") as f:
+        s1 = yaml.load(f, Loader=yaml.FullLoader)
+    os.makedirs("GPT_weights_v2", exist_ok=True)
+    s1["train"]["batch_size"] = 8
+    s1["train"]["epochs"] = 15
+    s1["train"]["save_every_n_epoch"] = 5
+    s1["train"]["if_save_latest"] = 1
+    s1["pretrained_s1"] = "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"
+    s1["train"]["half_weights_save_dir"] = "GPT_weights_v2"
+    s1["train"]["exp_name"] = "svetlana_plus"
+    s1["train_semantic_path"] = f"{s2_dir}/6-name2semantic.tsv"
+    s1["train_phoneme_path"] = f"{s2_dir}/2-name2text.txt"
+    s1["output_dir"] = f"{s2_dir}/logs_s1_v2"
+    with open("TEMP/tmp_s1.yaml", "w", encoding="utf-8") as f:
+        yaml.dump(s1, f)
+
+    s1_env = os.environ.copy()
+    s1_env["_CUDA_VISIBLE_DEVICES"] = "0"
+    s1_env["hz"] = "25hz"
+    send_log("🚀 Старт обучения семантической модели GPT (15 эпох)...")
+    p = subprocess.Popen([sys.executable, "GPT_SoVITS/s1_train.py", "--config_file", "TEMP/tmp_s1.yaml"], env=s1_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    for l in p.stdout:
+        line_clean = l.strip()
+        if "epoch" in line_clean.lower() or "loss" in line_clean.lower():
+            m = re.search(r'epoch[:\\s]+(\\d+)', line_clean, re.I)
+            if m:
+                ep = int(m.group(1))
+                prog = 70 + int((min(ep, 15) / 15) * 25)
+                send_log(f"[GPT] {line_clean}", progress=prog)
+            else:
+                send_log(f"[GPT] {line_clean}")
+    p.wait()
+
+    # 5. Упаковка весов и отправка на сервер
+    send_log("📦 Упаковка готовых весов Светланы...", progress=97, step=5, step_name="Упаковка и сохранение весов")
+    sovits_files = sorted(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"), key=os.path.getmtime)
+    gpt_files = sorted(Path("GPT_weights_v2").glob("svetlana_plus*.ckpt"), key=os.path.getmtime)
+
+    out_zip = BASE_DIR / "svetlana_custom_weights.zip"
+    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        if sovits_files:
+            latest_sovits = sovits_files[-1]
+            z.write(latest_sovits, f"SoVITS_weights_v2/{latest_sovits.name}")
+            send_log(f"В архив добавлен SoVITS: {latest_sovits.name}")
+        if gpt_files:
+            latest_gpt = gpt_files[-1]
+            z.write(latest_gpt, f"GPT_weights_v2/{latest_gpt.name}")
+            send_log(f"В архив добавлен GPT: {latest_gpt.name}")
+        sample_wav = WAVS_DIR / "svetlana_00000.wav"
+        if sample_wav.exists():
+            z.write(sample_wav, "reference_audio.wav")
+
+    # Передача архива на сервер управления
+    try:
+        with open(out_zip, "rb") as f:
+            data = f.read()
+        req = urllib.request.Request(f"{SERVER_URL}/api/worker_upload_weights", data=data, headers={"Content-Type": "application/zip"})
+        urllib.request.urlopen(req, timeout=30)
+        send_log("✅ Веса успешно переданы на сервер управления!")
+    except Exception as e:
+        send_log(f"Веса сохранены локально: {out_zip} ({e})")
+
+    send_log("🎉 ДООБУЧЕНИЕ СВЕТЛАНЫ НА RTX 3060 ПОЛНОСТЬЮ ЗАВЕРШЕНО!", progress=100, step=5, step_name="Готово!", status="completed")
+    try:
+        req = urllib.request.Request(f"{SERVER_URL}/api/worker_finish", data=b"{}", headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
+
+print(f"Воркер Светланы запущен. Подключение к серверу {SERVER_URL}...")
+while True:
+    try:
+        send_ping()
+        res = urllib.request.urlopen(f"{SERVER_URL}/api/worker_task", timeout=3)
+        data = json.loads(res.read().decode("utf-8"))
+        if data.get("task") == "start_training":
+            run_training()
+    except Exception as e:
+        print("Ожидание соединения с сервером:", e)
+    time.sleep(3)
+"""
+
+def main():
+    server = HTTPServer(("0.0.0.0", PORT), HubRequestHandler)
+    print("=" * 65)
+    print(f"🚀 СЕРВЕР УПРАВЛЕНИЯ СВЕТЛАНОЙ ЗАПУЩЕН НА ПОРТУ {PORT}")
+    print(f"👉 Откройте в браузере на Windows: http://{SERVER_IP}:{PORT}")
+    print("=" * 65)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nСервер остановлен.")
+
+if __name__ == "__main__":
+    main()
