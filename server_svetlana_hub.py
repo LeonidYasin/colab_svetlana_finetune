@@ -27,10 +27,21 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 
 PORT = 8888
-SERVER_IP = "192.168.0.106"
+SERVER_IP = "192.168.0.102"
 BASE_DIR = Path(__file__).parent.resolve()
 AUDIO_CACHE_DIR = BASE_DIR / "test_audios"
 AUDIO_CACHE_DIR.mkdir(exist_ok=True)
+
+def get_current_lan_ip():
+    try:
+        import subprocess
+        out = subprocess.check_output(['ip', 'addr', 'show', 'wlan0'], timeout=1).decode('utf-8')
+        m = re.search(r'inet\s+([0-9\.]+)', out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "192.168.0.102"
 
 hub_state = {
     "worker_connected": False,
@@ -50,6 +61,12 @@ hub_state = {
 }
 
 class HubRequestHandler(BaseHTTPRequestHandler):
+    def get_server_host(self):
+        hdr = self.headers.get("Host", "")
+        if hdr:
+            return hdr.split(":")[0]
+        return get_current_lan_ip()
+
     def do_HEAD(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -59,12 +76,13 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        server_ip = self.get_server_host()
 
         if path == "/" or path == "/index.html":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_PAGE.replace("{{SERVER_IP}}", SERVER_IP).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+            self.wfile.write(HTML_PAGE.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8"))
 
         elif path == "/api/status":
             self.send_response(200)
@@ -143,19 +161,19 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/x-bat")
             self.send_header("Content-Disposition", 'attachment; filename="setup_svetlana.bat"')
             self.end_headers()
-            self.wfile.write(SETUP_BAT_SCRIPT.replace("{{SERVER_IP}}", SERVER_IP).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+            self.wfile.write(SETUP_BAT_SCRIPT.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8"))
 
         elif path == "/setup.ps1":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(SETUP_PS1_SCRIPT.replace("{{SERVER_IP}}", SERVER_IP).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+            self.wfile.write(SETUP_PS1_SCRIPT.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8"))
 
         elif path == "/worker.py":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(WORKER_PY_SCRIPT.replace("{{SERVER_IP}}", SERVER_IP).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+            self.wfile.write(WORKER_PY_SCRIPT.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8"))
 
         elif path == "/download_weights":
             weights_zip = BASE_DIR / "svetlana_custom_weights.zip"
