@@ -922,7 +922,7 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         const term = document.getElementById('terminal');
-        const newLogs = (data.logs || []).join('\n');
+        const newLogs = (data.logs || []).join(String.fromCharCode(10));
         if (term.innerText !== newLogs) {
           const sel = window.getSelection();
           const isUserSelecting = sel && sel.rangeCount > 0 && term.contains(sel.anchorNode) && !sel.isCollapsed;
