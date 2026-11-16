@@ -7,10 +7,11 @@
 1. Веб-интерфейс с двумя кнопками:
    - Кнопка 1: Скачать и установить всё для Windows (RTX 3060)
    - Кнопка 2: Запустить дообучение в 1 клик
-2. Диспетчер задач для Windows-воркера (RTX 3060).
-3. Потоковое отображение логов, эпох и прогресса обучения в браузере в реальном времени.
-4. Раздачу готового студийного датасета (dataset_svetlana.zip).
-5. Приём и выдачу готовых дообученных весов (svetlana_custom_weights.zip).
+2. Блок интерактивного тестового синтеза речи (проверка ударений + и голоса прямо в браузере).
+3. Диспетчер задач для Windows-воркера (RTX 3060).
+4. Потоковое отображение логов, эпох и прогресса обучения в браузере в реальном времени.
+5. Раздачу готового студийного датасета (dataset_svetlana.zip).
+6. Приём и выдачу готовых дообученных весов (svetlana_custom_weights.zip).
 """
 
 import os
@@ -28,26 +29,36 @@ import urllib.parse
 PORT = 8888
 SERVER_IP = "192.168.0.106"
 BASE_DIR = Path(__file__).parent.resolve()
+AUDIO_CACHE_DIR = BASE_DIR / "test_audios"
+AUDIO_CACHE_DIR.mkdir(exist_ok=True)
 
 hub_state = {
     "worker_connected": False,
     "worker_ip": "",
     "gpu_name": "Ожидание подключения Windows...",
     "vram_gb": 0.0,
+    "has_weights": False,
     "status": "waiting_worker",  # waiting_worker, ready, running, completed, error
     "step": 0,
     "step_name": "Ожидание подключения Windows RTX 3060",
     "progress": 0,
     "task": "none",              # none, start_training
+    "tts_task": None,            # {"id": str, "text": str, "status": "pending"|"processing"|"ready"|"error"}
     "logs": [f"[{time.strftime('%H:%M:%S')}] 🌐 Сервер запущен. Откройте страницу http://{SERVER_IP}:{PORT} на компьютере с Windows."],
     "elapsed_sec": 0,
     "start_time": None
 }
 
 class HubRequestHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
 
         if path == "/" or path == "/index.html":
             self.send_response(200)
@@ -65,12 +76,41 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(hub_state, ensure_ascii=False).encode("utf-8"))
 
         elif path == "/api/worker_task":
-            # Windows воркер опрашивает сервер на наличие команд
+            # Windows воркер опрашивает сервер на наличие задач обучения и синтеза
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
-            resp = {"task": hub_state["task"]}
+            resp = {
+                "task": hub_state["task"],
+                "tts_task": hub_state["tts_task"]
+            }
             self.wfile.write(json.dumps(resp).encode("utf-8"))
+
+        elif path == "/api/tts_status":
+            req_id = query.get("id", [""])[0]
+            status = "none"
+            if hub_state["tts_task"] and hub_state["tts_task"]["id"] == req_id:
+                status = hub_state["tts_task"]["status"]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"id": req_id, "status": status}).encode("utf-8"))
+
+        elif path == "/api/test_audio":
+            req_id = query.get("id", [""])[0]
+            audio_path = AUDIO_CACHE_DIR / f"test_{req_id}.wav"
+            if audio_path.exists():
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(audio_path.stat().st_size))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with open(audio_path, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+            else:
+                self.send_response(404)
+                self.end_headers()
 
         elif path == "/raw_data.json":
             raw_path = BASE_DIR / "raw_data.json"
@@ -137,6 +177,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
         length = int(self.headers.get("Content-Length", 0))
 
         if path == "/api/worker_upload_weights":
@@ -150,11 +191,33 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                         break
                     f.write(chunk)
                     remaining -= len(chunk)
+            hub_state["has_weights"] = True
             log_msg(f"📦 Готовые веса получены с Windows ({weights_zip.stat().st_size / 1024 / 1024:.1f} МБ)!")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "received"}).encode("utf-8"))
+            return
+
+        elif path == "/api/worker_upload_tts":
+            # Прием сгенерированного аудиофайла от Windows воркера
+            req_id = query.get("id", [""])[0]
+            audio_path = AUDIO_CACHE_DIR / f"test_{req_id}.wav"
+            with open(audio_path, "wb") as f:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+            if hub_state["tts_task"] and hub_state["tts_task"]["id"] == req_id:
+                hub_state["tts_task"]["status"] = "ready"
+            log_msg(f"🔊 Тестовая реплика [{req_id}] успешно синтезирована на RTX 3060 ({audio_path.stat().st_size // 1024} КБ)!")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "saved"}).encode("utf-8"))
             return
 
         body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
@@ -178,6 +241,23 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
 
+        elif path == "/api/test_tts":
+            # Пользователь нажал «Озвучить тест»
+            text = data.get("text", "").strip()
+            if not text:
+                text = "В подсозн+ании ж+енщины запечатл+елся +образ себ+я как вдов+ы."
+            req_id = str(int(time.time() * 1000))
+            hub_state["tts_task"] = {
+                "id": req_id,
+                "text": text,
+                "status": "pending"
+            }
+            log_msg(f"🎙️ Запрос тестовой озвучки: «{text[:60]}...» (ID: {req_id})")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "queued", "id": req_id}).encode("utf-8"))
+
         elif path == "/api/worker_ping":
             # Воркер с Windows сообщает о своем статусе
             hub_state["worker_connected"] = True
@@ -186,6 +266,8 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 hub_state["gpu_name"] = data["gpu_name"]
             if "vram_gb" in data:
                 hub_state["vram_gb"] = data["vram_gb"]
+            if "has_weights" in data:
+                hub_state["has_weights"] = bool(data["has_weights"])
             if hub_state["status"] == "waiting_worker":
                 hub_state["status"] = "ready"
                 hub_state["step_name"] = "Окружение Windows готово к обучению"
@@ -207,6 +289,8 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 hub_state["step_name"] = data["step_name"]
             if "status" in data:
                 hub_state["status"] = data["status"]
+            if "has_weights" in data:
+                hub_state["has_weights"] = bool(data["has_weights"])
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -215,6 +299,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         elif path == "/api/worker_finish":
             # Завершение обучения
             hub_state["status"] = "completed"
+            hub_state["has_weights"] = True
             hub_state["task"] = "none"
             hub_state["progress"] = 100
             hub_state["step"] = 5
@@ -270,7 +355,7 @@ HTML_PAGE = """<!DOCTYPE html>
       align-items: center;
       padding: 30px 15px;
     }
-    .container { width: 100%; max-width: 860px; }
+    .container { width: 100%; max-width: 880px; }
     .header { text-align: center; margin-bottom: 25px; }
     .header h1 {
       font-size: 26px;
@@ -422,10 +507,43 @@ HTML_PAGE = """<!DOCTYPE html>
       font-size: 12px;
       line-height: 1.5;
       color: #93c5fd;
-      height: 240px;
+      height: 220px;
       overflow-y: auto;
       white-space: pre-wrap;
     }
+
+    .tts-input {
+      width: 100%;
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 10px;
+      color: white;
+      padding: 12px 14px;
+      font-size: 14px;
+      line-height: 1.5;
+      resize: vertical;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .tts-input:focus { border-color: #3b82f6; }
+
+    .preset-btn {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #93c5fd;
+      padding: 6px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: all 0.2s;
+    }
+    .preset-btn:hover {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: #3b82f6;
+      color: white;
+    }
+
     .btn-download-weights {
       display: block;
       width: 100%;
@@ -449,6 +567,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <p>100% автоматизация: точные ударения (+), русская фонетика ARPA, ~7 минут на видеокарте</p>
     </div>
 
+    <!-- КАРТОЧКА 1: УПРАВЛЕНИЕ ОБУЧЕНИЕМ -->
     <div class="card">
       <div id="statusBadge" class="status-badge">
         <span>●</span> <span id="statusText">Ожидание подключения Windows RTX 3060...</span>
@@ -493,6 +612,49 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- КАРТОЧКА 2: ИНТЕРАКТИВНАЯ ТЕСТОВАЯ ОЗВУЧКА СВЕТЛАНЫ -->
+    <div class="card" id="testTtsCard">
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+        <h3 style="font-size: 18px; color: #34d399; display: flex; align-items: center; gap: 8px;">
+          <span>🎧</span> <span>Тестовая озвучка голосом Светланы (Проверка ударений +)</span>
+        </h3>
+        <span id="ttsReadyBadge" style="font-size: 12px; padding: 4px 12px; border-radius: 12px; background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3);">
+          Ожидание обучения модели
+        </span>
+      </div>
+
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px; line-height: 1.5;">
+        Введите любую фразу. Ставьте знак <b>+</b> перед ударной гласной (например: <i>вдов+ы</i>, <i>перво+образ</i>, <i>стор+ицей</i>), чтобы убедиться в безошибочном послушании нейросети:
+      </p>
+
+      <textarea id="ttsTextInput" class="tts-input" rows="3">В подсозн+ании ж+енщины запечатл+елся +образ себ+я как вдов+ы. А там в тр+аурных од+еждах сид+ели две вд+овы.</textarea>
+
+      <!-- Быстрые пресеты для проверки ключевых слов книги -->
+      <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="preset-btn" onclick="setPreset(1)">1. Вдов+ы vs Вд+овы</button>
+        <button class="preset-btn" onclick="setPreset(2)">2. Перво+образ</button>
+        <button class="preset-btn" onclick="setPreset(3)">3. В+ерхом vs Верх+ом</button>
+        <button class="preset-btn" onclick="setPreset(4)">4. Стор+ицей и обр+ёк</button>
+      </div>
+
+      <div style="margin-top: 15px;">
+        <button id="btnSynthesize" class="action-btn btn-step2" style="width: 100%;" onclick="requestSynthesis()" disabled>
+          <span>🔊 ОЗВУЧИТЬ НА RTX 3060</span>
+          <span id="btnSynthSubtext" class="btn-subtext">Активируется после готовности весов</span>
+        </button>
+      </div>
+
+      <!-- Аудиоплеер для мгновенного прослушивания -->
+      <div id="audioPlayerBox" style="display: none; margin-top: 16px; padding: 14px; background: rgba(0,0,0,0.3); border-radius: 12px; border: 1px solid rgba(255,255,255,0.08);">
+        <div style="font-size: 13px; margin-bottom: 8px; color: #93c5fd; font-weight: 600; display: flex; justify-content: space-between;">
+          <span>Результат синтеза Светланы:</span>
+          <span id="audioStatusText" style="color: #34d399;">Готово к воспроизведению</span>
+        </div>
+        <audio id="audioResult" controls autoplay style="width: 100%; height: 42px; border-radius: 8px;"></audio>
+      </div>
+    </div>
+
+    <!-- КАРТОЧКА 3: ТЕРМИНАЛ ЛОГОВ -->
     <div class="card" style="padding: 16px;">
       <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--text-muted); display: flex; justify-content: space-between;">
         <span>Терминал вывода RTX 3060 в реальном времени:</span>
@@ -509,12 +671,77 @@ HTML_PAGE = """<!DOCTYPE html>
       alert('Команда скопирована в буфер обмена! Нажмите Ctrl+V в окне PowerShell на Windows.');
     }
 
+    function setPreset(idx) {
+      const input = document.getElementById('ttsTextInput');
+      if (idx === 1) {
+        input.value = "В подсозн+ании ж+енщины запечатл+елся +образ себ+я как вдов+ы. А там в тр+аурных од+еждах сид+ели две вд+овы.";
+      } else if (idx === 2) {
+        input.value = "+Именно в н+ём нах+одится иде+альный перво+образ вс+якого бл+ага, пребыв+ающий в Бож+ественном р+азуме.";
+      } else if (idx === 3) {
+        input.value = "Сос+еди м+огут счесть +это в+ерхом неприл+ичия, но вс+адник +ехал верх+ом по холм+ам.";
+      } else if (idx === 4) {
+        input.value = "+Этот д+ар вернётся стор+ицей к том+у, кто отд+ал ег+о с люб+овью, а сомн+ения обр+екли ег+о на пров+ал.";
+      }
+    }
+
     async function startTraining() {
       const btn = document.getElementById('btnTrain');
       btn.disabled = true;
       btn.innerHTML = '<span>⏳ ОБУЧЕНИЕ ЗАПУСКАЕТСЯ НА RTX 3060...</span>';
       await fetch('/api/start_training', { method: 'POST' });
     }
+
+    async function requestSynthesis() {
+      const btn = document.getElementById('btnSynthesize');
+      const text = document.getElementById('ttsTextInput').value.trim();
+      if (!text) {
+        alert('Введите текст для озвучки!');
+        return;
+      }
+      btn.disabled = true;
+      btn.innerHTML = '<span>⏳ СИНТЕЗ НА RTX 3060...</span><span class="btn-subtext">Нейросеть генерирует аудио...</span>';
+
+      try {
+        const res = await fetch('/api/test_tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: jsonString({ text })
+        });
+        const data = await res.json();
+        const reqId = data.id;
+
+        // Опрос статуса генерации
+        const pollTts = setInterval(async () => {
+          try {
+            const check = await fetch('/api/tts_status?id=' + reqId);
+            const cdata = await check.json();
+            if (cdata.status === 'ready') {
+              clearInterval(pollTts);
+              btn.disabled = false;
+              btn.innerHTML = '<span>🔊 ОЗВУЧИТЬ НА RTX 3060</span><span class="btn-subtext">Синтез завершён за пару секунд!</span>';
+              
+              const pBox = document.getElementById('audioPlayerBox');
+              const aRes = document.getElementById('audioResult');
+              pBox.style.display = 'block';
+              aRes.src = '/api/test_audio?id=' + reqId + '&t=' + Date.now();
+              aRes.play();
+            } else if (cdata.status === 'error') {
+              clearInterval(pollTts);
+              btn.disabled = false;
+              btn.innerHTML = '<span>⚠️ ОШИБКА СИНТЕЗА</span>';
+            }
+          } catch (e) {
+            console.error(e);
+          }
+        }, 800);
+
+      } catch (err) {
+        alert('Ошибка отправки: ' + err);
+        btn.disabled = false;
+      }
+    }
+
+    function jsonString(obj) { return JSON.stringify(obj); }
 
     async function poll() {
       try {
@@ -523,18 +750,31 @@ HTML_PAGE = """<!DOCTYPE html>
 
         const badge = document.getElementById('statusBadge');
         const btnTrain = document.getElementById('btnTrain');
-        const btnSub = document.getElementById('btnTrainSubtext');
+        const btnSynth = document.getElementById('btnSynthesize');
+        const ttsBadge = document.getElementById('ttsReadyBadge');
+        const btnSynthSub = document.getElementById('btnSynthSubtext');
 
         if (data.worker_connected) {
           badge.className = 'status-badge connected';
           badge.innerHTML = `<span>🟢</span> <span>Windows на связи: ${data.gpu_name} (${data.vram_gb} GB VRAM)</span>`;
-          if (data.status === 'ready') {
+          if (data.status === 'ready' || data.status === 'completed') {
             btnTrain.disabled = false;
             btnTrain.innerHTML = '<span>🚀 КНОПКА 2. ЗАПУСТИТЬ ДООБУЧЕНИЕ</span><span class="btn-subtext">RTX 3060 готова! Нажмите для старта (~7 мин)</span>';
           }
         } else {
           badge.className = 'status-badge';
           badge.innerHTML = `<span>●</span> <span>${data.step_name}</span>`;
+        }
+
+        if (data.has_weights || data.status === 'completed') {
+          ttsBadge.style.background = 'rgba(16, 185, 129, 0.15)';
+          ttsBadge.style.color = '#34d399';
+          ttsBadge.style.borderColor = 'rgba(16, 185, 129, 0.3)';
+          ttsBadge.innerText = '✅ Модель Светланы готова к озвучке!';
+          if (!btnSynth.innerHTML.includes('СИНТЕЗ НА RTX 3060')) {
+            btnSynth.disabled = false;
+            btnSynthSub.innerText = 'Нажмите для мгновенного синтеза на RTX 3060';
+          }
         }
 
         if (data.status === 'running') {
@@ -556,7 +796,7 @@ HTML_PAGE = """<!DOCTYPE html>
           document.getElementById('timerText').innerText = `${m}:${s}`;
         }
 
-        // Обновление иконок шагов
+        // Обновление шагов
         for (let i = 1; i <= 5; i++) {
           const el = document.getElementById('st' + i);
           el.className = 'step-item';
@@ -706,6 +946,13 @@ DATASET_DIR = BASE_DIR / "dataset_svetlana"
 WAVS_DIR = DATASET_DIR / "wavs"
 LOGS_DIR = BASE_DIR / "logs" / "svetlana_plus"
 
+tts_engine = None
+
+def check_has_weights():
+    sovits = list(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"))
+    gpt = list(Path("GPT_weights_v2").glob("svetlana_plus*.ckpt"))
+    return bool(sovits and gpt)
+
 def send_ping():
     gpu_name = "NVIDIA CUDA"
     vram_gb = 0.0
@@ -718,19 +965,21 @@ def send_ping():
             gpu_name = "CPU (CUDA не активен)"
     except Exception as e:
         gpu_name = f"Python (без torch: {e})"
-    data = json.dumps({"gpu_name": gpu_name, "vram_gb": vram_gb}).encode("utf-8")
+    has_w = check_has_weights()
+    data = json.dumps({"gpu_name": gpu_name, "vram_gb": vram_gb, "has_weights": has_w}).encode("utf-8")
     req = urllib.request.Request(f"{SERVER_URL}/api/worker_ping", data=data, headers={"Content-Type": "application/json"})
     try:
         urllib.request.urlopen(req, timeout=3)
     except Exception as e:
         print("Ошибка связи с сервером при ping:", e)
 
-def send_log(msg, progress=None, step=None, step_name=None, status=None):
+def send_log(msg, progress=None, step=None, step_name=None, status=None, has_weights=None):
     payload = {"msg": msg}
     if progress is not None: payload["progress"] = progress
     if step is not None: payload["step"] = step
     if step_name is not None: payload["step_name"] = step_name
     if status is not None: payload["status"] = status
+    if has_weights is not None: payload["has_weights"] = has_weights
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(f"{SERVER_URL}/api/worker_log", data=data, headers={"Content-Type": "application/json"})
     try:
@@ -738,6 +987,80 @@ def send_log(msg, progress=None, step=None, step_name=None, status=None):
     except Exception:
         pass
     print(f">> {msg}")
+
+def get_tts():
+    global tts_engine
+    if tts_engine is not None:
+        return tts_engine
+    sovits = sorted(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"), key=os.path.getmtime)
+    gpt = sorted(Path("GPT_weights_v2").glob("svetlana_plus*.ckpt"), key=os.path.getmtime)
+    if not sovits or not gpt:
+        return None
+    try:
+        import torch
+        sys.path.append(str(BASE_DIR))
+        sys.path.append(str(BASE_DIR / "GPT_SoVITS"))
+        from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
+        cfg = TTS_Config()
+        cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
+        cfg.is_half = torch.cuda.is_available()
+        cfg.version = "v2"
+        cfg.t2s_weights_path = str(gpt[-1])
+        cfg.vits_weights_path = str(sovits[-1])
+        tts_engine = TTS(cfg)
+        print("✅ Движок инференса Светланы успешно загружен!")
+        return tts_engine
+    except Exception as e:
+        print("Ошибка загрузки TTS:", e)
+        return None
+
+def handle_tts_task(task):
+    global tts_engine
+    req_id = task.get("id")
+    text_to_speak = task.get("text", "")
+    send_log(f"🎙️ Выполняется синтез речи: «{text_to_speak}»")
+    tts = get_tts()
+    if not tts:
+        send_log("⚠️ Не найдены обученные веса Светланы!")
+        return
+
+    ref_wav = WAVS_DIR / "svetlana_00000.wav"
+    if not ref_wav.exists():
+        wavs = list(WAVS_DIR.glob("*.wav"))
+        ref_wav = wavs[0] if wavs else None
+    ref_text = "В подсознании женщины запечатлелся образ себя как вдовы."
+
+    try:
+        gen = tts.run({
+            "text": text_to_speak,
+            "text_lang": "ru",
+            "ref_audio_path": str(ref_wav),
+            "prompt_text": ref_text,
+            "prompt_lang": "ru"
+        })
+        sr, audio_data = next(gen)
+        tmp_out = BASE_DIR / f"test_out_{req_id}.wav"
+        try:
+            import soundfile as sf
+            sf.write(str(tmp_out), audio_data, sr)
+        except ImportError:
+            from scipy.io import wavfile
+            wavfile.write(str(tmp_out), sr, audio_data)
+
+        with open(tmp_out, "rb") as f:
+            wav_bytes = f.read()
+
+        req = urllib.request.Request(
+            f"{SERVER_URL}/api/worker_upload_tts?id={req_id}",
+            data=wav_bytes,
+            headers={"Content-Type": "audio/wav"}
+        )
+        urllib.request.urlopen(req, timeout=15)
+        send_log(f"✅ Аудио реплики отправлено на сервер (ID: {req_id})")
+        try: tmp_out.unlink()
+        except: pass
+    except Exception as e:
+        send_log(f"⚠️ Ошибка синтеза реплики: {e}")
 
 def run_training():
     send_log("🚀 Запуск дообучения Светланы на RTX 3060...", progress=5, step=1, step_name="Подготовка студийного датасета (102 фразы)", status="running")
@@ -827,7 +1150,6 @@ def run_training():
     for l in p.stdout:
         line_clean = l.strip()
         if "epoch" in line_clean.lower() or "loss" in line_clean.lower():
-            # Извлекаем номер эпохи если есть
             m = re.search(r'epoch[:\\s]+(\\d+)', line_clean, re.I)
             if m:
                 ep = int(m.group(1))
@@ -899,11 +1221,11 @@ def run_training():
             data = f.read()
         req = urllib.request.Request(f"{SERVER_URL}/api/worker_upload_weights", data=data, headers={"Content-Type": "application/zip"})
         urllib.request.urlopen(req, timeout=30)
-        send_log("✅ Веса успешно переданы на сервер управления!")
+        send_log("✅ Веса успешно переданы на сервер управления!", has_weights=True)
     except Exception as e:
-        send_log(f"Веса сохранены локально: {out_zip} ({e})")
+        send_log(f"Веса сохранены локально: {out_zip} ({e})", has_weights=True)
 
-    send_log("🎉 ДООБУЧЕНИЕ СВЕТЛАНЫ НА RTX 3060 ПОЛНОСТЬЮ ЗАВЕРШЕНО!", progress=100, step=5, step_name="Готово!", status="completed")
+    send_log("🎉 ДООБУЧЕНИЕ СВЕТЛАНЫ НА RTX 3060 ПОЛНОСТЬЮ ЗАВЕРШЕНО!", progress=100, step=5, step_name="Готово!", status="completed", has_weights=True)
     try:
         req = urllib.request.Request(f"{SERVER_URL}/api/worker_finish", data=b"{}", headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
@@ -911,6 +1233,7 @@ def run_training():
         pass
 
 print(f"Воркер Светланы запущен. Подключение к серверу {SERVER_URL}...")
+last_handled_tts = None
 while True:
     try:
         send_ping()
@@ -918,9 +1241,14 @@ while True:
         data = json.loads(res.read().decode("utf-8"))
         if data.get("task") == "start_training":
             run_training()
+        tts_task = data.get("tts_task")
+        if tts_task and tts_task.get("status") == "pending":
+            if tts_task.get("id") != last_handled_tts:
+                last_handled_tts = tts_task.get("id")
+                handle_tts_task(tts_task)
     except Exception as e:
         print("Ожидание соединения с сервером:", e)
-    time.sleep(3)
+    time.sleep(2)
 """
 
 def main():
