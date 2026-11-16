@@ -276,6 +276,13 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"status": "queued", "id": req_id}).encode("utf-8"))
 
+        elif path == "/api/clear_task":
+            hub_state["task"] = "none"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "cleared"}).encode("utf-8"))
+
         elif path == "/api/worker_ping":
             # Воркер с Windows сообщает о своем статусе
             hub_state["worker_connected"] = True
@@ -960,17 +967,18 @@ if (Test-Path "$VenvDir\\Scripts\\python.exe") {
     Write-Host "🐍 Используется изолированный Python (venv): $PythonExe" -ForegroundColor Green
 }
 
-# 2.3 Настройка PyTorch CUDA и фикс NumPy < 2
-Write-Host "⚙️ Настройка PyTorch CUDA и NumPy..." -ForegroundColor Cyan
+# 2.3 Настройка PyTorch CUDA и зависимостей GPT-SoVITS
+Write-Host "⚙️ Настройка зависимостей GPT-SoVITS (transformers, librosa, pytorch-lightning)..." -ForegroundColor Cyan
 & $PythonExe -m pip install "numpy<2" -q
 $cudaCheck = & $PythonExe -c "import torch; print(torch.cuda.is_available())" 2>$null
 if ($cudaCheck -ne "True") {
     Write-Host "📦 Установка PyTorch с поддержкой CUDA для вашей RTX 3060..." -ForegroundColor Yellow
     & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     & $PythonExe -m pip install "numpy<2" -q
-    & $PythonExe -m pip install -q soundfile scipy pyyaml psutil edge-tts
 }
-Write-Host "✅ PyTorch с поддержкой CUDA готов к работе!" -ForegroundColor Green
+Write-Host "📦 Установка модулей (transformers, librosa, pytorch-lightning)..." -ForegroundColor Cyan
+& $PythonExe -m pip install -q transformers librosa scipy tensorboard pytorch-lightning tqdm einops rotary_embedding_torch soundfile pyyaml psutil numba
+Write-Host "✅ PyTorch CUDA и все библиотеки готовы к работе!" -ForegroundColor Green
 
 # 3. Клонирование GPT-SoVITS если директория не содержит репозитория
 if (-not (Test-Path "GPT_SoVITS")) {
@@ -1038,11 +1046,12 @@ def check_dependencies():
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "install", "numpy<2", "-q"])
         subprocess.run([sys.executable, "-m", "pip", "install", "torch", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu121"])
-    for pkg in ["soundfile", "pyyaml", "scipy"]:
+    for pkg in ["transformers", "librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm", "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil", "numba"]:
         try:
             __import__(pkg)
         except ImportError:
-            subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg])
+            pip_name = pkg.replace("_", "-")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip_name])
 
 def check_has_weights():
     sovits = list(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"))
@@ -1337,7 +1346,14 @@ while True:
         res = urllib.request.urlopen(f"{SERVER_URL}/api/worker_task", timeout=3)
         data = json.loads(res.read().decode("utf-8"))
         if data.get("task") == "start_training":
-            run_training()
+            try:
+                urllib.request.urlopen(urllib.request.Request(f"{SERVER_URL}/api/clear_task", data=b"{}", headers={"Content-Type": "application/json"}))
+            except Exception:
+                pass
+            try:
+                run_training()
+            except Exception as e:
+                send_log(f"❌ Ошибка обучения: {e}", status="error")
         tts_task = data.get("tts_task")
         if tts_task and tts_task.get("status") == "pending":
             if tts_task.get("id") != last_handled_tts:
