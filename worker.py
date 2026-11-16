@@ -107,7 +107,7 @@ def check_dependencies():
         assert getattr(transformers, "is_torch_available")()
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "install", "transformers==4.43.3", "-q"])
-    for pkg in ["librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm", "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil", "numba", "x_transformers"]:
+    for pkg in ["librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm", "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil", "numba", "x_transformers", "matplotlib", "torchmetrics"]:
         try:
             __import__(pkg)
         except ImportError:
@@ -380,6 +380,12 @@ def run_training():
         send_log("✅ Обучение SoVITS успешно завершено!", progress=70, step=4, step_name="Обучение GPT (15 эпох на RTX 3060)")
 
     # 4. Обучение GPT (15 эпох)
+    for pkg in ["matplotlib", "torchmetrics"]:
+        try:
+            __import__(pkg)
+        except ImportError:
+            send_log(f"📦 Установка {pkg}...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg])
     try:
         import pandas
         assert getattr(pandas, "__version__", "").startswith("2.1")
