@@ -899,21 +899,63 @@ if ($foundDir) {
 Set-Location $WorkDir
 Write-Host "📁 Рабочая директория: $WorkDir" -ForegroundColor Cyan
 
-# 2. Определение интерпретатора Python
-$PythonExe = "python"
+# 2. Определение интерпретатора Python (для PyTorch CUDA на RTX 3060 нужен Python 3.10 или 3.11)
+$PythonExe = $null
+
 if (Test-Path "runtime\\python.exe") {
     $PythonExe = (Resolve-Path "runtime\\python.exe").Path
     Write-Host "🐍 Используется встроенный Python сборки: $PythonExe" -ForegroundColor Green
-} elseif (Test-Path "runtime\\bin\\python.exe") {
-    $PythonExe = (Resolve-Path "runtime\\bin\\python.exe").Path
-    Write-Host "🐍 Используется runtime Python: $PythonExe" -ForegroundColor Green
-} elseif (Get-Command python -ErrorAction SilentlyContinue) {
-    Write-Host "🐍 Обнаружен системный Python!" -ForegroundColor Green
-} else {
-    Write-Host "⚠️ Python не найден. Устанавливаем через winget..." -ForegroundColor Yellow
-    winget install --id Python.Python.3.10 -e --source winget
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 }
+
+if (-not $PythonExe -and (Get-Command py -ErrorAction SilentlyContinue)) {
+    if ((& py -3.10 -c "print(1)" 2>$null) -eq "1") {
+        $PythonExe = "py -3.10"
+        Write-Host "🐍 Используется Python 3.10 (через py launcher)!" -ForegroundColor Green
+    } elseif ((& py -3.11 -c "print(1)" 2>$null) -eq "1") {
+        $PythonExe = "py -3.11"
+        Write-Host "🐍 Используется Python 3.11 (через py launcher)!" -ForegroundColor Green
+    }
+}
+
+if (-not $PythonExe -and (Test-Path "C:\\Python310\\python.exe")) {
+    $PythonExe = "C:\\Python310\\python.exe"
+} elseif (-not $PythonExe -and (Test-Path "C:\\Python311\\python.exe")) {
+    $PythonExe = "C:\\Python311\\python.exe"
+}
+
+if (-not $PythonExe -and (Get-Command python -ErrorAction SilentlyContinue)) {
+    $ver = & python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+    if ($ver -and [float]$ver -ge 3.13) {
+        Write-Host "⚠️ Обнаружен Python $ver. Для CUDA на RTX 3060 устанавливаем Python 3.10..." -ForegroundColor Yellow
+        winget install --id Python.Python.3.10 -e --source winget --accept-package-agreements --accept-source-agreements
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        if (Get-Command py -ErrorAction SilentlyContinue) {
+            $PythonExe = "py -3.10"
+        } else {
+            $PythonExe = "python"
+        }
+    } else {
+        $PythonExe = "python"
+        Write-Host "🐍 Используется системный Python ($ver)!" -ForegroundColor Green
+    }
+}
+
+if (-not $PythonExe) {
+    Write-Host "⚠️ Python не найден. Устанавливаем Python 3.10 через winget..." -ForegroundColor Yellow
+    winget install --id Python.Python.3.10 -e --source winget --accept-package-agreements --accept-source-agreements
+    $PythonExe = "python"
+}
+
+# 2.1 Проверка PyTorch и CUDA
+Write-Host "⚙️ Проверка PyTorch с поддержкой CUDA на RTX 3060..." -ForegroundColor Cyan
+$cudaCheck = & $PythonExe -c "import torch; print(torch.cuda.is_available())" 2>$null
+if ($cudaCheck -ne "True") {
+    Write-Host "📦 Установка PyTorch с поддержкой CUDA для вашей RTX 3060..." -ForegroundColor Yellow
+    & $PythonExe -m pip install -q --upgrade pip
+    & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    & $PythonExe -m pip install -q soundfile scipy pyyaml psutil
+}
+Write-Host "✅ PyTorch с поддержкой CUDA готов к работе!" -ForegroundColor Green
 
 # 3. Клонирование GPT-SoVITS если директория не содержит репозитория
 if (-not (Test-Path "GPT_SoVITS")) {
