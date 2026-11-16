@@ -343,6 +343,12 @@ def run_training():
     send_log("✅ Признаки датасета извлечены!", progress=40, step=3, step_name="Обучение SoVITS (20 эпох на RTX 3060)")
 
     # 3. Обучение SoVITS (20 эпох)
+    s2_dir = "logs/svetlana_plus"
+    os.makedirs(f"{s2_dir}/logs_s2_v2", exist_ok=True)
+    os.makedirs(f"{s2_dir}/logs_s1_v2", exist_ok=True)
+    os.makedirs("SoVITS_weights_v2", exist_ok=True)
+    os.makedirs("GPT_weights_v2", exist_ok=True)
+
     sovits_files = list(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"))
     if sovits_files:
         send_log(f"✅ Акустическая модель SoVITS уже обучена ({sovits_files[-1].name})! Пропускаем повторное обучение...", progress=70, step=4, step_name="Обучение GPT (15 эпох на RTX 3060)")
@@ -350,9 +356,6 @@ def run_training():
         s2_cfg_path = find_existing_path(["GPT_SoVITS/configs/s2.json", "configs/s2.json"])
         with open(s2_cfg_path, "r", encoding="utf-8") as f:
             s2 = json.load(f)
-        s2_dir = "logs/svetlana_plus"
-        os.makedirs(f"{s2_dir}/logs_s2_v2", exist_ok=True)
-        os.makedirs("SoVITS_weights_v2", exist_ok=True)
         s2["train"]["batch_size"] = 8
         s2["train"]["epochs"] = 20
         s2["train"]["save_every_epoch"] = 5
