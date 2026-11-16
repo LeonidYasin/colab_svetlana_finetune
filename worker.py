@@ -113,6 +113,11 @@ def check_dependencies():
         except ImportError:
             pip_name = pkg.replace("_", "-")
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip_name])
+    try:
+        import pandas
+        assert getattr(pandas, "__version__", "").startswith("2.1")
+    except Exception:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "numpy<2", "pandas==2.1.4"])
 
 def check_has_weights():
     sovits = list(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"))
@@ -338,36 +343,46 @@ def run_training():
     send_log("✅ Признаки датасета извлечены!", progress=40, step=3, step_name="Обучение SoVITS (20 эпох на RTX 3060)")
 
     # 3. Обучение SoVITS (20 эпох)
-    s2_cfg_path = find_existing_path(["GPT_SoVITS/configs/s2.json", "configs/s2.json"])
-    with open(s2_cfg_path, "r", encoding="utf-8") as f:
-        s2 = json.load(f)
-    s2_dir = "logs/svetlana_plus"
-    os.makedirs(f"{s2_dir}/logs_s2_v2", exist_ok=True)
-    os.makedirs("SoVITS_weights_v2", exist_ok=True)
-    s2["train"]["batch_size"] = 8
-    s2["train"]["epochs"] = 20
-    s2["train"]["save_every_epoch"] = 5
-    s2["train"]["if_save_latest"] = 1
-    s2["train"]["if_save_every_weights"] = True
-    s2["train"]["text_low_lr_rate"] = 0.4
-    s2["train"]["gpu_numbers"] = "0"
-    s2["train"]["pretrained_s2G"] = find_existing_path(["GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth", "pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"])
-    s2["train"]["pretrained_s2D"] = find_existing_path(["GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2D2333k.pth", "pretrained_models/gsv-v2final-pretrained/s2D2333k.pth"])
-    s2["model"]["version"] = "v2"
-    s2["data"]["exp_dir"] = s2["s2_ckpt_dir"] = s2_dir
-    s2["save_weight_dir"] = "SoVITS_weights_v2"
-    s2["name"] = "svetlana_plus"
-    s2["version"] = "v2"
-    os.makedirs("TEMP", exist_ok=True)
-    with open("TEMP/tmp_s2.json", "w", encoding="utf-8") as f:
-        json.dump(s2, f)
+    sovits_files = list(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"))
+    if sovits_files:
+        send_log(f"✅ Акустическая модель SoVITS уже обучена ({sovits_files[-1].name})! Пропускаем повторное обучение...", progress=70, step=4, step_name="Обучение GPT (15 эпох на RTX 3060)")
+    else:
+        s2_cfg_path = find_existing_path(["GPT_SoVITS/configs/s2.json", "configs/s2.json"])
+        with open(s2_cfg_path, "r", encoding="utf-8") as f:
+            s2 = json.load(f)
+        s2_dir = "logs/svetlana_plus"
+        os.makedirs(f"{s2_dir}/logs_s2_v2", exist_ok=True)
+        os.makedirs("SoVITS_weights_v2", exist_ok=True)
+        s2["train"]["batch_size"] = 8
+        s2["train"]["epochs"] = 20
+        s2["train"]["save_every_epoch"] = 5
+        s2["train"]["if_save_latest"] = 1
+        s2["train"]["if_save_every_weights"] = True
+        s2["train"]["text_low_lr_rate"] = 0.4
+        s2["train"]["gpu_numbers"] = "0"
+        s2["train"]["pretrained_s2G"] = find_existing_path(["GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth", "pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"])
+        s2["train"]["pretrained_s2D"] = find_existing_path(["GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2D2333k.pth", "pretrained_models/gsv-v2final-pretrained/s2D2333k.pth"])
+        s2["model"]["version"] = "v2"
+        s2["data"]["exp_dir"] = s2["s2_ckpt_dir"] = s2_dir
+        s2["save_weight_dir"] = "SoVITS_weights_v2"
+        s2["name"] = "svetlana_plus"
+        s2["version"] = "v2"
+        os.makedirs("TEMP", exist_ok=True)
+        with open("TEMP/tmp_s2.json", "w", encoding="utf-8") as f:
+            json.dump(s2, f)
 
-    send_log("🚀 Старт обучения акустической модели SoVITS (20 эпох)...")
-    run_command_logged([sys.executable, "GPT_SoVITS/s2_train.py", "--config", "TEMP/tmp_s2.json"], env, "[SoVITS]")
+        send_log("🚀 Старт обучения акустической модели SoVITS (20 эпох)...")
+        run_command_logged([sys.executable, "GPT_SoVITS/s2_train.py", "--config", "TEMP/tmp_s2.json"], env, "[SoVITS]")
 
-    send_log("✅ Обучение SoVITS успешно завершено!", progress=70, step=4, step_name="Обучение GPT (15 эпох на RTX 3060)")
+        send_log("✅ Обучение SoVITS успешно завершено!", progress=70, step=4, step_name="Обучение GPT (15 эпох на RTX 3060)")
 
     # 4. Обучение GPT (15 эпох)
+    try:
+        import pandas
+        assert getattr(pandas, "__version__", "").startswith("2.1")
+    except Exception:
+        send_log("📦 Настройка совместимой версии pandas (2.1.4) для модели GPT...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "numpy<2", "pandas==2.1.4"])
     import yaml
     s1_cfg_path = find_existing_path(["GPT_SoVITS/configs/s1longer-v2.yaml", "configs/s1longer-v2.yaml"])
     with open(s1_cfg_path, "r", encoding="utf-8") as f:
