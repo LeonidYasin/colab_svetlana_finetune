@@ -908,12 +908,14 @@ if (Test-Path "runtime\\python.exe") {
 }
 
 if (-not $PythonExe -and (Get-Command py -ErrorAction SilentlyContinue)) {
-    if ((& py -3.10 -c "print(1)" 2>$null) -eq "1") {
-        $PythonExe = "py -3.10"
-        Write-Host "🐍 Используется Python 3.10 (через py launcher)!" -ForegroundColor Green
-    } elseif ((& py -3.11 -c "print(1)" 2>$null) -eq "1") {
-        $PythonExe = "py -3.11"
-        Write-Host "🐍 Используется Python 3.11 (через py launcher)!" -ForegroundColor Green
+    $p10 = & py -3.10 -c "import sys; print(sys.executable)" 2>$null
+    $p11 = & py -3.11 -c "import sys; print(sys.executable)" 2>$null
+    if ($p10) {
+        $PythonExe = $p10.Trim()
+        Write-Host "🐍 Найден Python 3.10: $PythonExe" -ForegroundColor Green
+    } elseif ($p11) {
+        $PythonExe = $p11.Trim()
+        Write-Host "🐍 Найден Python 3.11: $PythonExe" -ForegroundColor Green
     }
 }
 
@@ -930,7 +932,8 @@ if (-not $PythonExe -and (Get-Command python -ErrorAction SilentlyContinue)) {
         winget install --id Python.Python.3.10 -e --source winget --accept-package-agreements --accept-source-agreements
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
         if (Get-Command py -ErrorAction SilentlyContinue) {
-            $PythonExe = "py -3.10"
+            $p = & py -3.10 -c "import sys; print(sys.executable)" 2>$null
+            if ($p) { $PythonExe = $p.Trim() } else { $PythonExe = "python" }
         } else {
             $PythonExe = "python"
         }
