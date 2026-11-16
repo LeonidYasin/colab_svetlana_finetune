@@ -4,6 +4,20 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
+# Monkeypatch transformers.HybridCache для полной совместимости с peft
+try:
+    import transformers
+    if not hasattr(transformers, "HybridCache"):
+        transformers.HybridCache = type("HybridCache", (), {})
+    try:
+        import transformers.cache_utils
+        if not hasattr(transformers.cache_utils, "HybridCache"):
+            transformers.cache_utils.HybridCache = transformers.HybridCache
+    except Exception:
+        pass
+except Exception:
+    pass
+
 import re
 import sys
 import json
@@ -22,6 +36,45 @@ WAVS_DIR = DATASET_DIR / "wavs"
 LOGS_DIR = BASE_DIR / "logs" / "svetlana_plus"
 
 tts_engine = None
+
+RU2ARPA = {
+    'а': ('AA0', 'AA1'), 'б': ('B',), 'в': ('V',), 'г': ('G',), 'д': ('D',),
+    'е': ('EH0', 'EH1'), 'ё': ('Y', 'AO1'), 'ж': ('ZH',), 'з': ('Z',),
+    'и': ('IY0', 'IY1'), 'й': ('Y',), 'к': ('K',), 'л': ('L',), 'м': ('M',),
+    'н': ('N',), 'о': ('AH0', 'AO1'), 'п': ('P',), 'р': ('R',), 'с': ('S',),
+    'т': ('T',), 'у': ('UW0', 'UW1'), 'ф': ('F',), 'х': ('HH',), 'ц': ('T', 'S'),
+    'ч': ('CH',), 'ш': ('SH',), 'щ': ('SH',), 'ъ': ('SP',), 'ы': ('IH0', 'IH1'),
+    'ь': ('Y',), 'э': ('EH0', 'EH1'), 'ю': ('Y', 'UW0', 'Y', 'UW1'), 'я': ('Y', 'AA0', 'Y', 'AA1'),
+}
+
+def ru_text_to_phones(text):
+    phones, i, text_lower, stressed = [], 0, text.lower(), False
+    while i < len(text_lower):
+        ch = text_lower[i]
+        if ch == '+':
+            stressed = True
+            i += 1
+            continue
+        if ch in RU2ARPA:
+            mapping = RU2ARPA[ch]
+            if len(mapping) == 2 and isinstance(mapping[0], str) and isinstance(mapping[1], str):
+                phones.append(mapping[1] if stressed else mapping[0])
+            elif ch == 'ё':
+                phones.extend(['Y', 'AO1'])
+            elif ch in ('ю', 'я'):
+                phones.append('Y')
+                phones.append('UW1' if (ch == 'ю' and stressed) else ('UW0' if ch == 'ю' else ('AA1' if stressed else 'AA0')))
+            else:
+                phones.extend(mapping)
+            stressed = False
+        elif ch in ('.', ',', '!', '?', '…', '-', '。', '，', '！', '？'):
+            phones.append('.' if ch == '。' else (',' if ch == '，' else ch))
+            stressed = False
+        elif ch == ' ':
+            phones.append('SP')
+            stressed = False
+        i += 1
+    return phones
 
 def patch_environment():
     # 1. Патч my_utils.py для надежной загрузки звука через soundfile + librosa без зависимости от ffmpeg.exe
@@ -112,14 +165,15 @@ def check_dependencies():
         "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil",
         "numba", "x_transformers", "matplotlib", "torchmetrics", "peft",
         "split_lang", "fast_langdetect", "wordsegment", "resampy",
-        "sentencepiece", "g2p_en"
+        "sentencepiece", "g2p_en", "ffmpeg"
     ]:
         try:
-            __import__(pkg)
-        except ImportError:
-            pip_name = pkg.replace("_", "-")
             if pkg == "peft":
-                pip_name = "peft<0.18.0"
+                from peft import LoraConfig, get_peft_model
+            else:
+                __import__(pkg)
+        except Exception:
+            pip_name = "peft==0.12.0" if pkg == "peft" else ("ffmpeg-python" if pkg == "ffmpeg" else pkg.replace("_", "-"))
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip_name])
     try:
         import pandas
@@ -210,14 +264,32 @@ def get_tts():
     if tts_engine is not None:
         return tts_engine
 
-    # Гарантируем наличие библиотек для инференса речи
-    for pkg in ["peft", "split_lang", "fast_langdetect", "wordsegment", "resampy", "sentencepiece", "g2p_en"]:
+    patch_environment()
+
+    try:
+        import transformers
+        if not hasattr(transformers, "HybridCache"):
+            transformers.HybridCache = type("HybridCache", (), {})
         try:
-            __import__(pkg)
-        except ImportError:
-            pip_name = pkg.replace("_", "-")
-            if pkg == "peft":
-                pip_name = "peft<0.18.0"
+            import transformers.cache_utils
+            if not hasattr(transformers.cache_utils, "HybridCache"):
+                transformers.cache_utils.HybridCache = transformers.HybridCache
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Гарантируем наличие библиотек для инференса речи
+    for pkg in ["peft", "split_lang", "fast_langdetect", "wordsegment", "resampy", "sentencepiece", "g2p_en", "ffmpeg"]:
+        try:
+            if pkg == "ffmpeg":
+                import ffmpeg
+            elif pkg == "peft":
+                from peft import LoraConfig, get_peft_model
+            else:
+                __import__(pkg)
+        except Exception:
+            pip_name = "peft==0.12.0" if pkg == "peft" else ("ffmpeg-python" if pkg == "ffmpeg" else pkg.replace("_", "-"))
             print(f"📦 [TTS] Доустановка {pip_name} для озвучки...")
             send_log(f"📦 Установка пакета {pip_name} для синтеза...")
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip_name])
@@ -238,8 +310,38 @@ def get_tts():
         cfg.version = "v2"
         cfg.t2s_weights_path = str(gpt[-1])
         cfg.vits_weights_path = str(sovits[-1])
+        if "ru" not in cfg.languages:
+            cfg.languages.extend(["ru", "all_ru"])
+        if hasattr(cfg, "v2_languages") and "ru" not in cfg.v2_languages:
+            cfg.v2_languages.extend(["ru", "all_ru"])
+
         send_log(f"🎯 Загрузка моделей: SoVITS={sovits[-1].name}, GPT={gpt[-1].name}")
         tts_engine = TTS(cfg)
+        if "ru" not in tts_engine.configs.languages:
+            tts_engine.configs.languages.extend(["ru", "all_ru"])
+
+        # Интеграция фонетизатора русской речи с ударениями (+)
+        from text import cleaned_text_to_sequence
+        orig_segment = tts_engine.text_preprocessor.segment_and_extract_feature_for_text
+        orig_pre_seg = tts_engine.text_preprocessor.pre_seg_text
+
+        def custom_segment(text, language, version="v2"):
+            if language in ("ru", "all_ru"):
+                phones_arpa = ru_text_to_phones(text)
+                phones = cleaned_text_to_sequence(phones_arpa, version)
+                bert = torch.zeros((1024, len(phones)), dtype=torch.float32).to(tts_engine.text_preprocessor.device)
+                return phones, bert, text
+            return orig_segment(text, language, version)
+
+        def custom_pre_seg(text, lang, text_split_method):
+            if lang in ("ru", "all_ru"):
+                sentences = [s.strip() for s in re.split(r'(?<=[.!?…])\s+', text) if s.strip()]
+                return sentences if sentences else [text]
+            return orig_pre_seg(text, lang, text_split_method)
+
+        tts_engine.text_preprocessor.segment_and_extract_feature_for_text = custom_segment
+        tts_engine.text_preprocessor.pre_seg_text = custom_pre_seg
+
         print("✅ Движок инференса Светланы успешно загружен!")
         send_log("✅ Движок синтеза речи Светланы готов к работе!")
         return tts_engine
@@ -266,7 +368,7 @@ def handle_tts_task(task):
     if not ref_wav.exists():
         wavs = list(WAVS_DIR.glob("*.wav")) or list(DATASET_DIR.glob("*.wav"))
         ref_wav = wavs[0] if wavs else None
-    ref_text = "В подсознании женщины запечатлелся образ себя как вдовы."
+    ref_text = "В подсозн+ании ж+енщины запечатл+елся +образ себ+я как вдов+ы."
 
     try:
         gen = tts.run({
@@ -276,7 +378,21 @@ def handle_tts_task(task):
             "prompt_text": ref_text,
             "prompt_lang": "ru"
         })
-        sr, audio_data = next(gen)
+        chunks = []
+        sr = 32000
+        for s_rate, chunk in gen:
+            sr = s_rate
+            chunks.append(chunk)
+
+        if not chunks:
+            raise RuntimeError("Движок синтеза не сгенерировал аудио данные")
+
+        if len(chunks) == 1:
+            audio_data = chunks[0]
+        else:
+            import numpy as np
+            audio_data = np.concatenate(chunks)
+
         tmp_out = BASE_DIR / f"test_out_{req_id}.wav"
         try:
             import soundfile as sf
@@ -298,6 +414,9 @@ def handle_tts_task(task):
         try: tmp_out.unlink()
         except: pass
     except Exception as e:
+        import traceback
+        err_tb = traceback.format_exc()
+        print("Ошибка синтеза реплики:\n", err_tb)
         send_log(f"⚠️ Ошибка синтеза реплики: {e}")
 
 def run_training():

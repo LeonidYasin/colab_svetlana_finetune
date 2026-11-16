@@ -82,8 +82,8 @@ if ($cudaCheck -ne "True") {
     & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     & $PythonExe -m pip install "numpy<2" -q
 }
-Write-Host "📦 Установка модулей GPT-SoVITS (transformers, peft, librosa)..." -ForegroundColor Cyan
-& $PythonExe -m pip install -q "numpy<2" "pandas==2.1.4" "transformers==4.43.3" "peft<0.18.0" librosa scipy tensorboard pytorch-lightning tqdm einops rotary_embedding_torch soundfile pyyaml psutil numba x-transformers matplotlib torchmetrics split-lang fast_langdetect wordsegment resampy sentencepiece g2p_en
+Write-Host "📦 Установка модулей GPT-SoVITS (transformers, peft 0.12.0, librosa)..." -ForegroundColor Cyan
+& $PythonExe -m pip install -q "numpy<2" "pandas==2.1.4" "transformers==4.43.3" "peft==0.12.0" ffmpeg-python librosa scipy tensorboard pytorch-lightning tqdm einops rotary_embedding_torch soundfile pyyaml psutil numba x-transformers matplotlib torchmetrics split-lang fast_langdetect wordsegment resampy sentencepiece g2p_en
 Write-Host "✅ PyTorch CUDA и все библиотеки готовы к работе!" -ForegroundColor Green
 
 # 3. Клонирование GPT-SoVITS если директория не содержит репозитория

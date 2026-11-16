@@ -542,6 +542,10 @@ HTML_PAGE = """<!DOCTYPE html>
       height: 220px;
       overflow-y: auto;
       white-space: pre-wrap;
+      user-select: text;
+      -webkit-user-select: text;
+      -moz-user-select: text;
+      cursor: text;
     }
 
     .tts-input {
@@ -688,19 +692,55 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <!-- КАРТОЧКА 3: ТЕРМИНАЛ ЛОГОВ -->
     <div class="card" style="padding: 16px;">
-      <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--text-muted); display: flex; justify-content: space-between;">
+      <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center;">
         <span>Терминал вывода RTX 3060 в реальном времени:</span>
-        <span id="timerText">00:00</span>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <button onclick="copyTerminalLogs()" style="font-size: 11px; padding: 4px 10px; background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.4); color: #60a5fa; border-radius: 6px; cursor: pointer; transition: all 0.2s;" onmouseover="this.style.background='rgba(59, 130, 246, 0.3)'" onmouseout="this.style.background='rgba(59, 130, 246, 0.15)'">📋 Скопировать весь лог</button>
+          <span id="timerText" style="font-family: monospace;">00:00</span>
+        </div>
       </div>
       <div id="terminal" class="terminal">Ожидание подключения воркера Windows...</div>
     </div>
   </div>
 
   <script>
+    function copyTerminalLogs() {
+      const term = document.getElementById('terminal');
+      const text = term.innerText;
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => {
+          alert('Логи терминала успешно скопированы в буфер обмена!');
+        }).catch(() => fallbackCopy(text));
+      } else {
+        fallbackCopy(text);
+      }
+    }
+
+    function fallbackCopy(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+        alert('Логи терминала успешно скопированы в буфер обмена!');
+      } catch (e) {
+        alert('Не удалось автоматически скопировать. Выделите текст мышью и нажмите Ctrl+C.');
+      }
+      document.body.removeChild(ta);
+    }
+
     function copyPS() {
       const code = document.getElementById('psCode').innerText;
-      navigator.clipboard.writeText(code);
-      alert('Команда скопирована в буфер обмена! Нажмите Ctrl+V в окне PowerShell на Windows.');
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(code).then(() => {
+          alert('Команда скопирована в буфер обмена! Нажмите Ctrl+V в окне PowerShell на Windows.');
+        }).catch(() => fallbackCopy(code));
+      } else {
+        fallbackCopy(code);
+      }
     }
 
     function setPreset(idx) {
@@ -844,8 +884,18 @@ HTML_PAGE = """<!DOCTYPE html>
         }
 
         const term = document.getElementById('terminal');
-        term.innerText = data.logs.join('\\n');
-        term.scrollTop = term.scrollHeight;
+        const newLogs = (data.logs || []).join('\n');
+        if (term.innerText !== newLogs) {
+          const sel = window.getSelection();
+          const isUserSelecting = sel && sel.rangeCount > 0 && term.contains(sel.anchorNode) && !sel.isCollapsed;
+          if (!isUserSelecting) {
+            const isScrolledToBottom = (term.scrollHeight - term.clientHeight) <= (term.scrollTop + 40);
+            term.innerText = newLogs;
+            if (isScrolledToBottom) {
+              term.scrollTop = term.scrollHeight;
+            }
+          }
+        }
 
       } catch (e) {
         console.error(e);
