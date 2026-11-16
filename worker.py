@@ -118,7 +118,7 @@ def patch_environment():
 
     # 2. Гарантируем доступность модулей GPT_SoVITS в корне рабочей папки
     gpt_dir = BASE_DIR / "GPT_SoVITS"
-    for item in ["feature_extractor", "module", "AR"]:
+    for item in ["feature_extractor", "module", "AR", "BigVGAN", "eres2net", "f5_tts", "text"]:
         src = gpt_dir / item
         dst = BASE_DIR / item
         if src.exists() and not dst.exists():
@@ -126,7 +126,7 @@ def patch_environment():
                 shutil.copytree(src, dst)
             except Exception:
                 pass
-    for item in ["utils.py", "process_ckpt.py"]:
+    for item in ["utils.py", "process_ckpt.py", "sv.py"]:
         src = gpt_dir / item
         dst = BASE_DIR / item
         if src.exists() and not dst.exists():
@@ -165,7 +165,7 @@ def check_dependencies():
         "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil",
         "numba", "x_transformers", "matplotlib", "torchmetrics", "peft",
         "split_lang", "fast_langdetect", "wordsegment", "resampy",
-        "sentencepiece", "g2p_en", "ffmpeg"
+        "sentencepiece", "g2p_en", "ffmpeg", "jieba", "cn2an", "pypinyin"
     ]:
         try:
             if pkg == "peft":
@@ -280,7 +280,7 @@ def get_tts():
         pass
 
     # Гарантируем наличие библиотек для инференса речи
-    for pkg in ["peft", "split_lang", "fast_langdetect", "wordsegment", "resampy", "sentencepiece", "g2p_en", "ffmpeg"]:
+    for pkg in ["peft", "split_lang", "fast_langdetect", "wordsegment", "resampy", "sentencepiece", "g2p_en", "ffmpeg", "jieba", "cn2an", "pypinyin"]:
         try:
             if pkg == "ffmpeg":
                 import ffmpeg
@@ -349,6 +349,23 @@ def get_tts():
         import traceback
         err_tb = traceback.format_exc()
         print("Ошибка загрузки TTS:\n", err_tb)
+        m = re.search(r"No module named ['\"]([^'\"]+)['\"]", str(e))
+        if m:
+            missing = m.group(1).split(".")[0]
+            print(f"📦 [TTS] Авто-установка недостающего модуля: {missing}...")
+            send_log(f"📦 Авто-установка недостающего модуля {missing}...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", missing])
+            try:
+                tts_engine = TTS(cfg)
+                if "ru" not in tts_engine.configs.languages:
+                    tts_engine.configs.languages.extend(["ru", "all_ru"])
+                tts_engine.text_preprocessor.segment_and_extract_feature_for_text = custom_segment
+                tts_engine.text_preprocessor.pre_seg_text = custom_pre_seg
+                print("✅ Движок инференса Светланы успешно загружен после доустановки модуля!")
+                send_log("✅ Движок синтеза речи Светланы готов к работе!")
+                return tts_engine
+            except Exception as e2:
+                print("Ошибка при повторной загрузке TTS:", e2)
         send_log(f"⚠️ Ошибка инициализации TTS: {e}\n{err_tb[-300:]}")
         return None
 
@@ -626,6 +643,21 @@ while True:
     try:
         send_ping()
         poll_count += 1
+
+        # Автоматическая синхронизация worker.py с сервером
+        if poll_count % 3 == 0:
+            try:
+                req_up = urllib.request.Request(f"{SERVER_URL}/worker.py", headers={"Cache-Control": "no-cache"})
+                server_code = urllib.request.urlopen(req_up, timeout=3).read().decode("utf-8")
+                my_file = Path(__file__).resolve()
+                if len(server_code) > 1000 and server_code.strip() != my_file.read_text(encoding="utf-8").strip():
+                    print("🔄 [Worker] Обнаружена новая версия worker.py на сервере! Самообновление и перезапуск...")
+                    send_log("🔄 Автообновление воркера Windows...")
+                    my_file.write_text(server_code, encoding="utf-8")
+                    os.execv(sys.executable, [sys.executable, str(my_file)])
+            except Exception:
+                pass
+
         if poll_count % 6 == 0:
             print(f"[{time.strftime('%H:%M:%S')}] 🟢 Связь с сервером активна ({SERVER_URL}). Ожидание команды...")
 
