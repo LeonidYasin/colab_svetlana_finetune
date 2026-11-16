@@ -949,14 +949,26 @@ if (-not $PythonExe) {
     $PythonExe = "python"
 }
 
-# 2.1 Проверка PyTorch и CUDA
-Write-Host "⚙️ Проверка PyTorch с поддержкой CUDA на RTX 3060..." -ForegroundColor Cyan
+# 2.2 Короткое виртуальное окружение venv (защита от WinError 206 / лимита 260 символов Windows)
+$VenvDir = "$WorkDir\\venv"
+if (-not (Test-Path "$VenvDir\\Scripts\\python.exe")) {
+    Write-Host "📦 Создание окружения venv (защита от длинных путей)..." -ForegroundColor Cyan
+    & $PythonExe -m venv $VenvDir
+}
+if (Test-Path "$VenvDir\\Scripts\\python.exe") {
+    $PythonExe = (Resolve-Path "$VenvDir\\Scripts\\python.exe").Path
+    Write-Host "🐍 Используется изолированный Python (venv): $PythonExe" -ForegroundColor Green
+}
+
+# 2.3 Настройка PyTorch CUDA и фикс NumPy < 2
+Write-Host "⚙️ Настройка PyTorch CUDA и NumPy..." -ForegroundColor Cyan
+& $PythonExe -m pip install "numpy<2" -q
 $cudaCheck = & $PythonExe -c "import torch; print(torch.cuda.is_available())" 2>$null
 if ($cudaCheck -ne "True") {
     Write-Host "📦 Установка PyTorch с поддержкой CUDA для вашей RTX 3060..." -ForegroundColor Yellow
-    & $PythonExe -m pip install -q --upgrade pip
     & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    & $PythonExe -m pip install -q soundfile scipy pyyaml psutil
+    & $PythonExe -m pip install "numpy<2" -q
+    & $PythonExe -m pip install -q soundfile scipy pyyaml psutil edge-tts
 }
 Write-Host "✅ PyTorch с поддержкой CUDA готов к работе!" -ForegroundColor Green
 
@@ -1018,9 +1030,13 @@ tts_engine = None
 
 def check_dependencies():
     try:
+        import numpy
+    except Exception:
+        subprocess.run([sys.executable, "-m", "pip", "install", "numpy<2", "-q"])
+    try:
         import torch
-    except ImportError:
-        print("📦 Установка PyTorch с поддержкой CUDA для RTX 3060...")
+    except Exception:
+        subprocess.run([sys.executable, "-m", "pip", "install", "numpy<2", "-q"])
         subprocess.run([sys.executable, "-m", "pip", "install", "torch", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu121"])
     for pkg in ["soundfile", "pyyaml", "scipy"]:
         try:
@@ -1044,7 +1060,7 @@ def send_ping():
         else:
             gpu_name = "CPU (CUDA не активен)"
     except Exception as e:
-        gpu_name = f"Python (без torch: {e})"
+        gpu_name = f"Python (ошибка torch: {str(e)[:120]})"
     has_w = check_has_weights()
     data = json.dumps({"gpu_name": gpu_name, "vram_gb": vram_gb, "has_weights": has_w}).encode("utf-8")
     req = urllib.request.Request(f"{SERVER_URL}/api/worker_ping", data=data, headers={"Content-Type": "application/json"})
