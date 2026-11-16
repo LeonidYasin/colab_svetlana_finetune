@@ -23,7 +23,7 @@ import shutil
 import zipfile
 import threading
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.parse
 
 PORT = 8888
@@ -43,34 +43,56 @@ def get_current_lan_ip():
         pass
     return "192.168.0.102"
 
+weights_exist = (BASE_DIR / "svetlana_custom_weights.zip").exists()
 hub_state = {
     "worker_connected": False,
     "last_ping": 0,
     "worker_ip": "",
     "gpu_name": "Ожидание подключения Windows...",
     "vram_gb": 0.0,
-    "has_weights": False,
-    "status": "waiting_worker",  # waiting_worker, ready, running, completed, error
-    "step": 0,
-    "step_name": "Ожидание подключения Windows RTX 3060",
-    "progress": 0,
+    "has_weights": weights_exist,
+    "status": "completed" if weights_exist else "waiting_worker",
+    "step": 5 if weights_exist else 0,
+    "step_name": "🎉 Модель Светланы обучена и готова к озвучке!" if weights_exist else "Ожидание подключения Windows RTX 3060",
+    "progress": 100 if weights_exist else 0,
     "task": "none",              # none, start_training
     "tts_task": None,            # {"id": str, "text": str, "status": "pending"|"processing"|"ready"|"error"}
-    "logs": [f"[{time.strftime('%H:%M:%S')}] 🌐 Сервер запущен. Откройте страницу http://{SERVER_IP}:{PORT} на компьютере с Windows."],
+    "logs": [f"[{time.strftime('%H:%M:%S')}] 🌐 Сервер запущен. Откройте http://{SERVER_IP}:{PORT} на компьютере с Windows."],
     "elapsed_sec": 0,
     "start_time": None
 }
+if weights_exist:
+    hub_state["logs"].append(f"[{time.strftime('%H:%M:%S')}] 🎉 Веса модели Светланы в наличии (svetlana_custom_weights.zip). Интерактивная озвучка активна!")
 
 class HubRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def get_server_host(self):
         hdr = self.headers.get("Host", "")
         if hdr:
             return hdr.split(":")[0]
         return get_current_lan_ip()
 
+    def send_bytes_response(self, content_bytes, content_type="text/html; charset=utf-8", status=200, extra_headers=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content_bytes)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(content_bytes)
+
+    def send_json_response(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_bytes_response(body, content_type="application/json; charset=utf-8", status=status)
+
     def do_HEAD(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Connection", "close")
         self.end_headers()
 
     def do_GET(self):
@@ -80,122 +102,95 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         server_ip = self.get_server_host()
 
         if path == "/" or path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(HTML_PAGE.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+            body = HTML_PAGE.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8")
+            self.send_bytes_response(body, content_type="text/html; charset=utf-8")
 
         elif path == "/api/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
             now = time.time()
             if hub_state.get("last_ping", 0) > 0 and (now - hub_state["last_ping"]) > 15 and hub_state["status"] != "running":
                 hub_state["worker_connected"] = False
             if hub_state["start_time"] and hub_state["status"] == "running":
                 hub_state["elapsed_sec"] = int(time.time() - hub_state["start_time"])
-            self.wfile.write(json.dumps(hub_state, ensure_ascii=False).encode("utf-8"))
+            self.send_json_response(hub_state)
 
         elif path == "/api/worker_task":
-            # Windows воркер опрашивает сервер на наличие задач обучения и синтеза
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
             resp = {
                 "task": hub_state["task"],
                 "tts_task": hub_state["tts_task"]
             }
-            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            self.send_json_response(resp)
 
         elif path == "/api/tts_status":
             req_id = query.get("id", [""])[0]
             status = "none"
             if hub_state["tts_task"] and hub_state["tts_task"]["id"] == req_id:
                 status = hub_state["tts_task"]["status"]
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps({"id": req_id, "status": status}).encode("utf-8"))
+            self.send_json_response({"id": req_id, "status": status})
 
         elif path == "/api/test_audio":
             req_id = query.get("id", [""])[0]
             audio_path = AUDIO_CACHE_DIR / f"test_{req_id}.wav"
             if audio_path.exists():
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/wav")
-                self.send_header("Content-Length", str(audio_path.stat().st_size))
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
                 with open(audio_path, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile)
+                    audio_bytes = f.read()
+                self.send_bytes_response(audio_bytes, content_type="audio/wav")
             else:
                 self.send_response(404)
+                self.send_header("Connection", "close")
                 self.end_headers()
 
         elif path == "/raw_data.json":
             raw_path = BASE_DIR / "raw_data.json"
             if raw_path.exists():
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.end_headers()
                 with open(raw_path, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile)
+                    data_bytes = f.read()
+                self.send_bytes_response(data_bytes, content_type="application/json; charset=utf-8")
             else:
                 self.send_response(404)
+                self.send_header("Connection", "close")
                 self.end_headers()
 
         elif path == "/dataset_svetlana.zip":
             zip_p = BASE_DIR / "dataset_svetlana.zip"
             if zip_p.exists():
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", 'attachment; filename="dataset_svetlana.zip"')
-                self.send_header("Content-Length", str(zip_p.stat().st_size))
-                self.end_headers()
                 with open(zip_p, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile)
+                    zip_bytes = f.read()
+                extra = {"Content-Disposition": 'attachment; filename="dataset_svetlana.zip"'}
+                self.send_bytes_response(zip_bytes, content_type="application/zip", extra_headers=extra)
             else:
                 self.send_response(404)
+                self.send_header("Connection", "close")
                 self.end_headers()
 
         elif path == "/setup.bat":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-bat")
-            self.send_header("Content-Disposition", 'attachment; filename="setup_svetlana.bat"')
-            self.end_headers()
-            self.wfile.write(SETUP_BAT_SCRIPT.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+            body = SETUP_BAT_SCRIPT.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8")
+            extra = {"Content-Disposition": 'attachment; filename="setup_svetlana.bat"'}
+            self.send_bytes_response(body, content_type="application/x-bat", extra_headers=extra)
 
         elif path == "/setup.ps1":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
             content = (BASE_DIR / "setup.ps1").read_text(encoding="utf-8")
-            self.wfile.write(content.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+            body = content.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8")
+            self.send_bytes_response(body, content_type="text/plain; charset=utf-8")
 
         elif path == "/worker.py":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
             content = (BASE_DIR / "worker.py").read_text(encoding="utf-8")
-            self.wfile.write(content.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8"))
+            body = content.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8")
+            self.send_bytes_response(body, content_type="text/plain; charset=utf-8")
 
         elif path == "/download_weights":
             weights_zip = BASE_DIR / "svetlana_custom_weights.zip"
             if weights_zip.exists():
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", 'attachment; filename="svetlana_custom_weights.zip"')
-                self.send_header("Content-Length", str(weights_zip.stat().st_size))
-                self.end_headers()
                 with open(weights_zip, "rb") as f:
-                    shutil.copyfileobj(f, self.wfile)
+                    zip_bytes = f.read()
+                extra = {"Content-Disposition": 'attachment; filename="svetlana_custom_weights.zip"'}
+                self.send_bytes_response(zip_bytes, content_type="application/zip", extra_headers=extra)
             else:
                 self.send_response(404)
+                self.send_header("Connection", "close")
                 self.end_headers()
         else:
             self.send_response(404)
+            self.send_header("Connection", "close")
             self.end_headers()
 
     def do_POST(self):
@@ -217,10 +212,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                     remaining -= len(chunk)
             hub_state["has_weights"] = True
             log_msg(f"📦 Готовые веса получены с Windows ({weights_zip.stat().st_size / 1024 / 1024:.1f} МБ)!")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "received"}).encode("utf-8"))
+            self.send_json_response({"status": "received"})
             return
 
         elif path == "/api/worker_upload_tts":
@@ -238,10 +230,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             if hub_state["tts_task"] and hub_state["tts_task"]["id"] == req_id:
                 hub_state["tts_task"]["status"] = "ready"
             log_msg(f"🔊 Тестовая реплика [{req_id}] успешно синтезирована на RTX 3060 ({audio_path.stat().st_size // 1024} КБ)!")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "saved"}).encode("utf-8"))
+            self.send_json_response({"status": "saved"})
             return
 
         body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
@@ -260,10 +249,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 hub_state["step"] = 1
                 hub_state["step_name"] = "Старт процесса на RTX 3060..."
                 log_msg("🚀 Команда на дообучение передана на видеокарту RTX 3060!")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
+            self.send_json_response({"status": "ok"})
 
         elif path == "/api/test_tts":
             # Пользователь нажал «Озвучить тест»
@@ -277,17 +263,11 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 "status": "pending"
             }
             log_msg(f"🎙️ Запрос тестовой озвучки: «{text[:60]}...» (ID: {req_id})")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "queued", "id": req_id}).encode("utf-8"))
+            self.send_json_response({"status": "queued", "id": req_id})
 
         elif path == "/api/clear_task":
             hub_state["task"] = "none"
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "cleared"}).encode("utf-8"))
+            self.send_json_response({"status": "cleared"})
 
         elif path == "/api/worker_ping":
             # Воркер с Windows сообщает о своем статусе
@@ -300,14 +280,16 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 hub_state["vram_gb"] = data["vram_gb"]
             if "has_weights" in data:
                 hub_state["has_weights"] = bool(data["has_weights"])
-            if hub_state["status"] in ["waiting_worker", "error"]:
+            if hub_state["has_weights"] and hub_state["status"] != "running":
+                hub_state["status"] = "completed"
+                hub_state["step"] = 5
+                hub_state["progress"] = 100
+                hub_state["step_name"] = "🎉 Модели Светланы обучены и готовы к озвучке!"
+            elif hub_state["status"] in ["waiting_worker", "error"]:
                 hub_state["status"] = "ready"
                 hub_state["step_name"] = "Окружение Windows готово к обучению"
                 log_msg(f"🟢 Подключен компьютер Windows ({hub_state['gpu_name']}, {hub_state['vram_gb']} GB VRAM). Готов к обучению!")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ack"}).encode("utf-8"))
+            self.send_json_response({"status": "ack"})
 
         elif path == "/api/worker_log":
             # Воркер отправляет логи и процент выполнения
@@ -323,16 +305,17 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                 hub_state["status"] = data["status"]
             if "has_weights" in data:
                 hub_state["has_weights"] = bool(data["has_weights"])
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ack"}).encode("utf-8"))
+            self.send_json_response({"status": "ack"})
 
         elif path == "/api/worker_finish":
             # Завершение обучения
             hub_state["status"] = "completed"
             hub_state["has_weights"] = True
             hub_state["task"] = "none"
+            hub_state["progress"] = 100
+            hub_state["step"] = 5
+            hub_state["step_name"] = "Обучение успешно завершено!"
+            self.send_json_response({"status": "acknowledged"})
             hub_state["progress"] = 100
             hub_state["step"] = 5
             hub_state["step_name"] = "Дообучение успешно завершено!"
@@ -927,7 +910,7 @@ pause
 
 # ==============================================================================
 def main():
-    server = HTTPServer(("0.0.0.0", PORT), HubRequestHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HubRequestHandler)
     print("=" * 65)
     print(f"🚀 СЕРВЕР УПРАВЛЕНИЯ СВЕТЛАНОЙ ЗАПУЩЕН НА ПОРТУ {PORT}")
     print(f"👉 Откройте в браузере на Windows: http://{SERVER_IP}:{PORT}")
