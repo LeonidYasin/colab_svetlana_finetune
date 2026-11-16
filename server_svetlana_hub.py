@@ -908,7 +908,12 @@ $s2g = "GPT_SoVITS\\pretrained_models\\gsv-v2final-pretrained\\s2G2333k.pth"
 if (-not (Test-Path $s2g)) {
     Write-Host "📥 Базовые модели v2 не найдены. Загрузка предобученных моделей с HuggingFace..." -ForegroundColor Yellow
     Invoke-WebRequest -Uri "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/pretrained_models.zip" -OutFile "pretrained_models.zip"
-    Expand-Archive -Path "pretrained_models.zip" -DestinationPath "GPT_SoVITS" -Force
+    Write-Host "📦 Распаковка архива моделей (пожалуйста, подождите 1-3 мин)..." -ForegroundColor Yellow
+    if (Get-Command tar.exe -ErrorAction SilentlyContinue) {
+        tar.exe -xf "pretrained_models.zip" -C "GPT_SoVITS"
+    } else {
+        Expand-Archive -Path "pretrained_models.zip" -DestinationPath "GPT_SoVITS" -Force
+    }
     Remove-Item "pretrained_models.zip" -Force -ErrorAction SilentlyContinue
     Write-Host "✅ Базовые модели успешно загружены и распакованы!" -ForegroundColor Green
 } else {
