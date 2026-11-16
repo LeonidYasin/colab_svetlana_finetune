@@ -310,12 +310,21 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             if not text:
                 text = "В подсозн+ании ж+енщины запечатл+елся +образ себ+я как вдов+ы."
             req_id = str(int(time.time() * 1000))
+            temp = float(data.get("temperature", 0.6))
+            top_p = float(data.get("top_p", 0.6))
+            speed = float(data.get("speed", 1.0))
+            ref_id = str(data.get("ref_id", "auto"))
             hub_state["tts_task"] = {
                 "id": req_id,
                 "text": text,
+                "temperature": temp,
+                "top_p": top_p,
+                "top_k": 20,
+                "speed": speed,
+                "ref_id": ref_id,
                 "status": "pending"
             }
-            log_msg(f"🎙️ Запрос тестовой озвучки: «{text[:60]}...» (ID: {req_id})")
+            log_msg(f"🎙️ Запрос чистой озвучки Светланы [T={temp:.2f}, TopP={top_p:.2f}, Реф: {ref_id}]: «{text[:55]}...» (ID: {req_id})")
             self.send_json_response({"status": "queued", "id": req_id})
 
         elif path == "/api/clear_task":
@@ -711,6 +720,62 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="preset-btn" onclick="setPreset(4)">4. Стор+ицей и обр+ёк</button>
       </div>
 
+      <!-- Студийные параметры синтеза (устранение цифрового шума) -->
+      <div style="margin-top: 14px; padding: 14px; background: rgba(0, 0, 0, 0.25); border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.08);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+          <span style="font-size: 13px; font-weight: 600; color: #a7f3d0; display: flex; align-items: center; gap: 6px;">
+            <span>🎛️</span> <span>Студийные параметры качества речи (RTX 3060)</span>
+          </span>
+          <div style="display: flex; gap: 6px;">
+            <button id="btnProfileStudio" class="preset-btn" style="border-color: #10b981; color: #34d399; background: rgba(16, 185, 129, 0.15);" onclick="applyQualityProfile('studio')">💎 Студийный чистый (0.60)</button>
+            <button id="btnProfileExpressive" class="preset-btn" onclick="applyQualityProfile('expressive')">🎭 Выразительный (0.75)</button>
+          </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; font-size: 12px;">
+          <div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px; color: var(--text-muted);">
+              <span>Температура (чистота звука):</span>
+              <b id="tempVal" style="color: #60a5fa; font-family: monospace;">0.60</b>
+            </div>
+            <input type="range" id="tempSlider" min="0.30" max="1.00" step="0.05" value="0.60" style="width: 100%; accent-color: #3b82f6;" oninput="document.getElementById('tempVal').innerText = parseFloat(this.value).toFixed(2)">
+            <span style="font-size: 11px; color: #64748b;">0.50–0.60: гладкий голос без металлического шума</span>
+          </div>
+
+          <div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px; color: var(--text-muted);">
+              <span>Top-P (фильтрация токенов):</span>
+              <b id="topPVal" style="color: #60a5fa; font-family: monospace;">0.60</b>
+            </div>
+            <input type="range" id="topPSlider" min="0.30" max="0.95" step="0.05" value="0.60" style="width: 100%; accent-color: #3b82f6;" oninput="document.getElementById('topPVal').innerText = parseFloat(this.value).toFixed(2)">
+            <span style="font-size: 11px; color: #64748b;">0.60: отсекает случайные искаженные токены</span>
+          </div>
+
+          <div>
+            <div style="display: flex; justify-content: space-between; margin-bottom: 4px; color: var(--text-muted);">
+              <span>Скорость речи:</span>
+              <b id="speedVal" style="color: #60a5fa; font-family: monospace;">1.00</b>
+            </div>
+            <input type="range" id="speedSlider" min="0.80" max="1.25" step="0.05" value="1.00" style="width: 100%; accent-color: #3b82f6;" oninput="document.getElementById('speedVal').innerText = parseFloat(this.value).toFixed(2)">
+            <span style="font-size: 11px; color: #64748b;">1.00: естественный студийный темп книги</span>
+          </div>
+
+          <div>
+            <div style="margin-bottom: 4px; color: var(--text-muted);">
+              <span>Эталонный сэмпл тембра:</span>
+            </div>
+            <select id="refPromptSelect" style="width: 100%; padding: 6px 8px; border-radius: 6px; background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.15); color: #e2e8f0; font-size: 12px;">
+              <option value="auto" selected>🎯 Автовыбор (рекомендуется — без коллизий)</option>
+              <option value="svetlana_00010">🎙️ Сквозь века (3.7с, нейтральный)</option>
+              <option value="svetlana_00007">🎙️ Этот дар (4.8с, выразительный)</option>
+              <option value="svetlana_00002">🎙️ Именно в нём (3.7с, спокойный)</option>
+              <option value="svetlana_00000">🎙️ В подсознании (4.5с)</option>
+            </select>
+            <span style="font-size: 11px; color: #64748b;">Предотвращает наложение промпта на реплику</span>
+          </div>
+        </div>
+      </div>
+
       <div style="margin-top: 15px;">
         <button id="btnSynthesize" class="action-btn btn-step2" style="width: 100%;" onclick="requestSynthesis()" disabled>
           <span>🔊 ОЗВУЧИТЬ НА RTX 3060</span>
@@ -794,6 +859,36 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     }
 
+    function applyQualityProfile(mode) {
+      const bStudio = document.getElementById('btnProfileStudio');
+      const bExpr = document.getElementById('btnProfileExpressive');
+      const sTemp = document.getElementById('tempSlider');
+      const sTopP = document.getElementById('topPSlider');
+      if (mode === 'studio') {
+        sTemp.value = "0.60";
+        sTopP.value = "0.60";
+        document.getElementById('tempVal').innerText = "0.60";
+        document.getElementById('topPVal').innerText = "0.60";
+        bStudio.style.borderColor = "#10b981";
+        bStudio.style.color = "#34d399";
+        bStudio.style.background = "rgba(16, 185, 129, 0.15)";
+        bExpr.style.borderColor = "";
+        bExpr.style.color = "";
+        bExpr.style.background = "";
+      } else {
+        sTemp.value = "0.75";
+        sTopP.value = "0.70";
+        document.getElementById('tempVal').innerText = "0.75";
+        document.getElementById('topPVal').innerText = "0.70";
+        bExpr.style.borderColor = "#f59e0b";
+        bExpr.style.color = "#fbbf24";
+        bExpr.style.background = "rgba(245, 158, 11, 0.15)";
+        bStudio.style.borderColor = "";
+        bStudio.style.color = "";
+        bStudio.style.background = "";
+      }
+    }
+
     async function startTraining() {
       const btn = document.getElementById('btnTrain');
       btn.disabled = true;
@@ -811,11 +906,22 @@ HTML_PAGE = """<!DOCTYPE html>
       btn.disabled = true;
       btn.innerHTML = '<span>⏳ СИНТЕЗ НА RTX 3060...</span><span class="btn-subtext">Нейросеть генерирует аудио...</span>';
 
+      const tempVal = parseFloat(document.getElementById('tempSlider').value) || 0.6;
+      const topPVal = parseFloat(document.getElementById('topPSlider').value) || 0.6;
+      const speedVal = parseFloat(document.getElementById('speedSlider').value) || 1.0;
+      const refIdVal = document.getElementById('refPromptSelect').value || "auto";
+
       try {
         const res = await fetch('/api/test_tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: jsonString({ text })
+          body: jsonString({
+            text: text,
+            temperature: tempVal,
+            top_p: topPVal,
+            speed: speedVal,
+            ref_id: refIdVal
+          })
         });
         const data = await res.json();
         const reqId = data.id;

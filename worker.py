@@ -335,8 +335,15 @@ def get_tts():
 
         def custom_pre_seg(text, lang, text_split_method):
             if lang in ("ru", "all_ru"):
-                sentences = [s.strip() for s in re.split(r'(?<=[.!?…])\s+', text) if s.strip()]
-                return sentences if sentences else [text]
+                raw_sentences = [s.strip() for s in re.split(r'(?<=[.!?…])\s+', text.strip()) if s.strip()]
+                if not raw_sentences:
+                    raw_sentences = [text.strip()]
+                res = []
+                for s in raw_sentences:
+                    if s and s[-1] not in ('.', '!', '?', '…', ',', ';', ':', '。', '！', '？'):
+                        s = s + '.'
+                    res.append(s)
+                return res
             return orig_pre_seg(text, lang, text_split_method)
 
         tts_engine.text_preprocessor.segment_and_extract_feature_for_text = custom_segment
@@ -369,32 +376,136 @@ def get_tts():
         send_log(f"⚠️ Ошибка инициализации TTS: {e}\n{err_tb[-300:]}")
         return None
 
+AVAILABLE_PROMPTS = {
+    "svetlana_00010": {
+        "file": "svetlana_00010.wav",
+        "text": "Сквозь век+а м+удрость остаётся неизм+енной.",
+        "name": "Сквозь века (3.7 сек, нейтральный)"
+    },
+    "svetlana_00007": {
+        "file": "svetlana_00007.wav",
+        "text": "+Этот д+ар вернётся стор+ицей к том+у, кто отд+ал ег+о с люб+овью.",
+        "name": "Этот дар (4.8 сек, выразительный)"
+    },
+    "svetlana_00002": {
+        "file": "svetlana_00002.wav",
+        "text": "+Именно в н+ём нах+одится иде+альный перво+образ.",
+        "name": "Именно в нём (3.7 сек, спокойный)"
+    },
+    "svetlana_00000": {
+        "file": "svetlana_00000.wav",
+        "text": "В подсозн+ании ж+енщины запечатл+елся +образ себ+я как вдов+ы.",
+        "name": "В подсознании (4.5 сек)"
+    }
+}
+
+def clean_and_normalize_audio(audio_data, sr=32000, target_peak_db=-1.0):
+    if audio_data is None or len(audio_data) == 0:
+        return audio_data
+    import numpy as np
+    if audio_data.dtype == np.int16:
+        float_audio = audio_data.astype(np.float32) / 32768.0
+    else:
+        float_audio = audio_data.astype(np.float32)
+        max_val = np.max(np.abs(float_audio))
+        if max_val > 1.0:
+            float_audio = float_audio / max_val
+
+    # 1. Удаление постоянного смещения (DC offset)
+    float_audio = float_audio - np.mean(float_audio)
+
+    # 2. Мягкие микрофейды 5 мс по краям для устранения щелчков
+    fade_len = int(sr * 0.005)
+    if len(float_audio) > fade_len * 2:
+        fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+        fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+        float_audio[:fade_len] *= fade_in
+        float_audio[-fade_len:] *= fade_out
+
+    # 3. Пиковая нормализация до target_peak_db (-1 dB = ~0.8912)
+    peak = np.max(np.abs(float_audio))
+    target_scale = 10.0 ** (target_peak_db / 20.0)
+    if peak > 1e-5:
+        float_audio = float_audio * (target_scale / peak)
+
+    return np.clip(float_audio * 32767.0, -32768.0, 32767.0).astype(np.int16)
+
+def resolve_ref_audio(preferred_id, text_to_speak):
+    chosen_id = preferred_id if preferred_id in AVAILABLE_PROMPTS else "svetlana_00010"
+
+    # Защита от коллизии промпта: если текст для озвучки совпадает с промптом или начинается с него,
+    # repetition_penalty (1.35) оштрафует правильные токены и приведет к хрипу и искажению!
+    clean_target = text_to_speak.replace("+", "").lower()
+    prompt_info = AVAILABLE_PROMPTS[chosen_id]
+    prompt_clean = prompt_info["text"].replace("+", "").lower()
+
+    first_words = " ".join(prompt_clean.split()[:2])
+    if prompt_clean in clean_target or first_words in clean_target:
+        for alt_id in ["svetlana_00010", "svetlana_00007", "svetlana_00002"]:
+            alt_clean = AVAILABLE_PROMPTS[alt_id]["text"].replace("+", "").lower()
+            alt_first = " ".join(alt_clean.split()[:2])
+            if alt_clean not in clean_target and alt_first not in clean_target:
+                chosen_id = alt_id
+                prompt_info = AVAILABLE_PROMPTS[chosen_id]
+                break
+
+    ref_filename = prompt_info["file"]
+    ref_text = prompt_info["text"]
+
+    for cand in [
+        WAVS_DIR / ref_filename,
+        DATASET_DIR / ref_filename,
+        DATASET_DIR / "wavs" / ref_filename,
+        BASE_DIR / ref_filename,
+        BASE_DIR / "reference_audio.wav"
+    ]:
+        if cand.exists():
+            return cand, ref_text, prompt_info.get("name", chosen_id)
+
+    wavs = list(WAVS_DIR.glob("*.wav")) or list(DATASET_DIR.glob("*.wav"))
+    if wavs:
+        return wavs[0], ref_text, wavs[0].name
+    return None, ref_text, chosen_id
+
 def handle_tts_task(task):
     global tts_engine
     req_id = task.get("id")
     text_to_speak = task.get("text", "")
-    send_log(f"🎙️ Выполняется синтез речи: «{text_to_speak}»")
+
+    temperature = float(task.get("temperature", 0.6))
+    top_p = float(task.get("top_p", 0.6))
+    top_k = int(task.get("top_k", 20))
+    speed = float(task.get("speed", 1.0))
+    ref_id = str(task.get("ref_id", "auto"))
+
+    ref_wav, ref_text, ref_name = resolve_ref_audio(ref_id, text_to_speak)
+    if not ref_wav or not ref_wav.exists():
+        send_log("⚠️ Ошибка: Образец эталонного голоса не найден на диске!")
+        return
+
+    send_log(f"🎙️ Выполняется синтез Светланы [T={temperature:.2f}, TopP={top_p:.2f}, Промпт: {ref_name}]: «{text_to_speak}»")
     tts = get_tts()
     if not tts:
         send_log("⚠️ Не удалось инициализировать синтез речи!")
         return
 
-    ref_wav = WAVS_DIR / "svetlana_00000.wav"
-    if not ref_wav.exists():
-        ref_wav = DATASET_DIR / "svetlana_00000.wav"
-    if not ref_wav.exists():
-        wavs = list(WAVS_DIR.glob("*.wav")) or list(DATASET_DIR.glob("*.wav"))
-        ref_wav = wavs[0] if wavs else None
-    ref_text = "В подсозн+ании ж+енщины запечатл+елся +образ себ+я как вдов+ы."
-
     try:
-        gen = tts.run({
+        inputs = {
             "text": text_to_speak,
             "text_lang": "ru",
             "ref_audio_path": str(ref_wav),
             "prompt_text": ref_text,
-            "prompt_lang": "ru"
-        })
+            "prompt_lang": "ru",
+            "top_k": top_k,             # 20 (официальное студийное значение)
+            "top_p": top_p,             # 0.60 (отсекает низковероятный шум)
+            "temperature": temperature, # 0.60 (чистый шелковистый звук без металлического хрипа)
+            "repetition_penalty": 1.35, # Предотвращает зацикливания
+            "parallel_infer": False,    # ПОСЛЕДОВАТЕЛЬНОЕ VITS-декодирование: устраняет артефакты грубой нарезки
+            "split_bucket": False,      # Строгий естественный порядок фраз
+            "fragment_interval": 0.25,  # 250 мс естественная пауза между предложениями
+            "speed_factor": speed,
+        }
+        gen = tts.run(inputs)
         chunks = []
         sr = 32000
         for s_rate, chunk in gen:
@@ -404,11 +515,9 @@ def handle_tts_task(task):
         if not chunks:
             raise RuntimeError("Движок синтеза не сгенерировал аудио данные")
 
-        if len(chunks) == 1:
-            audio_data = chunks[0]
-        else:
-            import numpy as np
-            audio_data = np.concatenate(chunks)
+        import numpy as np
+        audio_data = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+        audio_data = clean_and_normalize_audio(audio_data, sr=sr, target_peak_db=-1.0)
 
         tmp_out = BASE_DIR / f"test_out_{req_id}.wav"
         try:
@@ -427,7 +536,7 @@ def handle_tts_task(task):
             headers={"Content-Type": "audio/wav"}
         )
         urllib.request.urlopen(req, timeout=15)
-        send_log(f"✅ Аудио реплики отправлено на сервер (ID: {req_id})")
+        send_log(f"✅ Чистая реплика Светланы отправлена на сервер (ID: {req_id}, {len(audio_data)/sr:.2f}с, пик: -1.0 dB)")
         try: tmp_out.unlink()
         except: pass
     except Exception as e:
