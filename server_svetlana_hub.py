@@ -78,6 +78,9 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content_bytes)))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("Connection", "close")
         if extra_headers:
             for k, v in extra_headers.items():
@@ -88,6 +91,56 @@ class HubRequestHandler(BaseHTTPRequestHandler):
     def send_json_response(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_bytes_response(body, content_type="application/json; charset=utf-8", status=status)
+
+    def render_html_page(self, server_ip):
+        html = HTML_PAGE.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT))
+
+        # 1. Status badge
+        if hub_state["worker_connected"]:
+            b_class = "status-badge connected"
+            b_content = f"<span>🟢</span> <span>Windows на связи: {hub_state['gpu_name']} ({hub_state['vram_gb']} GB VRAM)</span>"
+        else:
+            b_class = "status-badge"
+            b_content = f"<span>●</span> <span>{hub_state['step_name']}</span>"
+        html = re.sub(r'<div id="statusBadge"[^>]*>.*?</div>', f'<div id="statusBadge" class="{b_class}">{b_content}</div>', html, flags=re.DOTALL)
+
+        # 2. Step name and progress
+        html = html.replace('<span id="stepName">Ожидание подключения воркера</span>', f'<span id="stepName">{hub_state["step_name"]}</span>')
+        html = html.replace('<span id="progressText">0%</span>', f'<span id="progressText">{hub_state["progress"]}%</span>')
+        html = html.replace('<div id="progressFill" class="progress-bar-fill"></div>', f'<div id="progressFill" class="progress-bar-fill" style="width: {hub_state["progress"]}%;"></div>')
+
+        # 3. Steps list
+        for i in range(1, 6):
+            if hub_state["step"] >= i or hub_state["status"] == "completed":
+                old_st = f'<div id="st{i}" class="step-item"><div class="step-icon">{i}</div>'
+                new_st = f'<div id="st{i}" class="step-item completed"><div class="step-icon">✓</div>'
+                html = html.replace(old_st, new_st)
+
+        # 4. Buttons and TTS card
+        if hub_state["has_weights"] or hub_state["status"] == "completed":
+            html = re.sub(
+                r'<span id="ttsReadyBadge"[^>]*>.*?</span>',
+                '<span id="ttsReadyBadge" style="font-size: 12px; padding: 4px 12px; border-radius: 12px; background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3);">✅ Модель Светланы готова к озвучке!</span>',
+                html, flags=re.DOTALL
+            )
+            html = html.replace(
+                '<button id="btnSynthesize" class="action-btn btn-step2" style="width: 100%;" onclick="requestSynthesis()" disabled>',
+                '<button id="btnSynthesize" class="action-btn btn-step2" style="width: 100%;" onclick="requestSynthesis()">'
+            )
+            html = html.replace('Активируется после готовности весов', 'Нажмите для мгновенного синтеза на RTX 3060')
+            html = html.replace(
+                '<button id="btnTrain" class="action-btn btn-step2" onclick="startTraining()" disabled>',
+                '<button id="btnTrain" class="action-btn btn-step2" disabled><span>🎉 ДООБУЧЕНИЕ УСПЕШНО ЗАВЕРШЕНО!</span>'
+            )
+            html = html.replace('<div id="downloadBox" style="display: none;">', '<div id="downloadBox" style="display: block;">')
+
+        # 5. Terminal logs
+        logs_str = "\n".join(hub_state["logs"])
+        html = html.replace(
+            '<div id="terminal" class="terminal">Ожидание подключения воркера Windows...</div>',
+            f'<div id="terminal" class="terminal">{logs_str}</div>'
+        )
+        return html.encode("utf-8")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -102,7 +155,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         server_ip = self.get_server_host()
 
         if path == "/" or path == "/index.html":
-            body = HTML_PAGE.replace("{{SERVER_IP}}", server_ip).replace("{{PORT}}", str(PORT)).encode("utf-8")
+            body = self.render_html_page(server_ip)
             self.send_bytes_response(body, content_type="text/html; charset=utf-8")
 
         elif path == "/api/status":
@@ -330,7 +383,9 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        pass
+        # Логируем запросы для отладки
+        if "/api/worker_ping" not in args[0] and "/api/worker_task" not in args[0] and "/api/status" not in args[0]:
+            print(f"[{time.strftime('%H:%M:%S')}] HTTP: {args[0]} from {self.client_address[0]}")
 
 def log_msg(msg):
     ts = time.strftime("%H:%M:%S")
