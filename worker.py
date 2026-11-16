@@ -107,11 +107,19 @@ def check_dependencies():
         assert getattr(transformers, "is_torch_available")()
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "install", "transformers==4.43.3", "-q"])
-    for pkg in ["librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm", "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil", "numba", "x_transformers", "matplotlib", "torchmetrics"]:
+    for pkg in [
+        "librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm",
+        "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil",
+        "numba", "x_transformers", "matplotlib", "torchmetrics", "peft",
+        "split_lang", "fast_langdetect", "wordsegment", "resampy",
+        "sentencepiece", "g2p_en"
+    ]:
         try:
             __import__(pkg)
         except ImportError:
             pip_name = pkg.replace("_", "-")
+            if pkg == "peft":
+                pip_name = "peft<0.18.0"
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip_name])
     try:
         import pandas
@@ -201,9 +209,23 @@ def get_tts():
     global tts_engine
     if tts_engine is not None:
         return tts_engine
+
+    # Гарантируем наличие библиотек для инференса речи
+    for pkg in ["peft", "split_lang", "fast_langdetect", "wordsegment", "resampy", "sentencepiece", "g2p_en"]:
+        try:
+            __import__(pkg)
+        except ImportError:
+            pip_name = pkg.replace("_", "-")
+            if pkg == "peft":
+                pip_name = "peft<0.18.0"
+            print(f"📦 [TTS] Доустановка {pip_name} для озвучки...")
+            send_log(f"📦 Установка пакета {pip_name} для синтеза...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip_name])
+
     sovits = sorted(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"), key=os.path.getmtime)
     gpt = sorted(Path("GPT_weights_v2").glob("svetlana_plus*.ckpt"), key=os.path.getmtime)
     if not sovits or not gpt:
+        send_log("⚠️ Веса моделей не найдены в SoVITS_weights_v2 или GPT_weights_v2!")
         return None
     try:
         import torch
@@ -216,11 +238,16 @@ def get_tts():
         cfg.version = "v2"
         cfg.t2s_weights_path = str(gpt[-1])
         cfg.vits_weights_path = str(sovits[-1])
+        send_log(f"🎯 Загрузка моделей: SoVITS={sovits[-1].name}, GPT={gpt[-1].name}")
         tts_engine = TTS(cfg)
         print("✅ Движок инференса Светланы успешно загружен!")
+        send_log("✅ Движок синтеза речи Светланы готов к работе!")
         return tts_engine
     except Exception as e:
-        print("Ошибка загрузки TTS:", e)
+        import traceback
+        err_tb = traceback.format_exc()
+        print("Ошибка загрузки TTS:\n", err_tb)
+        send_log(f"⚠️ Ошибка инициализации TTS: {e}\n{err_tb[-300:]}")
         return None
 
 def handle_tts_task(task):
@@ -230,12 +257,14 @@ def handle_tts_task(task):
     send_log(f"🎙️ Выполняется синтез речи: «{text_to_speak}»")
     tts = get_tts()
     if not tts:
-        send_log("⚠️ Не найдены обученные веса Светланы!")
+        send_log("⚠️ Не удалось инициализировать синтез речи!")
         return
 
     ref_wav = WAVS_DIR / "svetlana_00000.wav"
     if not ref_wav.exists():
-        wavs = list(WAVS_DIR.glob("*.wav"))
+        ref_wav = DATASET_DIR / "svetlana_00000.wav"
+    if not ref_wav.exists():
+        wavs = list(WAVS_DIR.glob("*.wav")) or list(DATASET_DIR.glob("*.wav"))
         ref_wav = wavs[0] if wavs else None
     ref_text = "В подсознании женщины запечатлелся образ себя как вдовы."
 
