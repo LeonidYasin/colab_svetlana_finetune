@@ -107,7 +107,7 @@ def check_dependencies():
         assert getattr(transformers, "is_torch_available")()
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "install", "transformers==4.43.3", "-q"])
-    for pkg in ["librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm", "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil", "numba"]:
+    for pkg in ["librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm", "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil", "numba", "x_transformers"]:
         try:
             __import__(pkg)
         except ImportError:
@@ -319,6 +319,11 @@ def run_training():
     run_command_logged([sys.executable, "GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py"], env, "[HuBERT]")
 
     send_log("2/2 Извлечение семантических признаков...")
+    try:
+        import x_transformers
+    except ImportError:
+        send_log("📦 Доустановка модуля x-transformers...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "x-transformers"])
     run_command_logged([sys.executable, "GPT_SoVITS/prepare_datasets/3-get-semantic.py"], env, "[Semantic]")
 
     tsv_parts = list(LOGS_DIR.glob("6-name2semantic-*.tsv"))

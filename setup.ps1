@@ -83,7 +83,7 @@ if ($cudaCheck -ne "True") {
     & $PythonExe -m pip install "numpy<2" -q
 }
 Write-Host "📦 Установка модулей (transformers==4.43.3, librosa, soundfile)..." -ForegroundColor Cyan
-& $PythonExe -m pip install -q "transformers==4.43.3" librosa scipy tensorboard pytorch-lightning tqdm einops rotary_embedding_torch soundfile pyyaml psutil numba ffmpeg-python
+& $PythonExe -m pip install -q "transformers==4.43.3" librosa scipy tensorboard pytorch-lightning tqdm einops rotary_embedding_torch soundfile pyyaml psutil numba x-transformers
 Write-Host "✅ PyTorch CUDA и все библиотеки готовы к работе!" -ForegroundColor Green
 
 # 3. Клонирование GPT-SoVITS если директория не содержит репозитория
