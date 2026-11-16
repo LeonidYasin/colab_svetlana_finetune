@@ -948,6 +948,18 @@ LOGS_DIR = BASE_DIR / "logs" / "svetlana_plus"
 
 tts_engine = None
 
+def check_dependencies():
+    try:
+        import torch
+    except ImportError:
+        print("📦 Установка PyTorch с поддержкой CUDA для RTX 3060...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "torch", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu121"])
+    for pkg in ["soundfile", "pyyaml", "scipy"]:
+        try:
+            __import__(pkg)
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg])
+
 def check_has_weights():
     sovits = list(Path("SoVITS_weights_v2").glob("svetlana_plus*.pth"))
     gpt = list(Path("GPT_weights_v2").glob("svetlana_plus*.ckpt"))
@@ -1233,6 +1245,7 @@ def run_training():
         pass
 
 print(f"Воркер Светланы запущен. Подключение к серверу {SERVER_URL}...")
+check_dependencies()
 last_handled_tts = None
 while True:
     try:
