@@ -976,8 +976,8 @@ if ($cudaCheck -ne "True") {
     & $PythonExe -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     & $PythonExe -m pip install "numpy<2" -q
 }
-Write-Host "📦 Установка модулей (transformers, librosa, pytorch-lightning)..." -ForegroundColor Cyan
-& $PythonExe -m pip install -q transformers librosa scipy tensorboard pytorch-lightning tqdm einops rotary_embedding_torch soundfile pyyaml psutil numba
+Write-Host "📦 Установка модулей (transformers==4.43.3, librosa, pytorch-lightning)..." -ForegroundColor Cyan
+& $PythonExe -m pip install -q "transformers==4.43.3" librosa scipy tensorboard pytorch-lightning tqdm einops rotary_embedding_torch soundfile pyyaml psutil numba
 Write-Host "✅ PyTorch CUDA и все библиотеки готовы к работе!" -ForegroundColor Green
 
 # 3. Клонирование GPT-SoVITS если директория не содержит репозитория
@@ -1046,7 +1046,12 @@ def check_dependencies():
     except Exception:
         subprocess.run([sys.executable, "-m", "pip", "install", "numpy<2", "-q"])
         subprocess.run([sys.executable, "-m", "pip", "install", "torch", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu121"])
-    for pkg in ["transformers", "librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm", "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil", "numba"]:
+    try:
+        import transformers
+        assert getattr(transformers, "is_torch_available")()
+    except Exception:
+        subprocess.run([sys.executable, "-m", "pip", "install", "transformers==4.43.3", "-q"])
+    for pkg in ["librosa", "scipy", "tensorboard", "pytorch_lightning", "tqdm", "einops", "rotary_embedding_torch", "soundfile", "pyyaml", "psutil", "numba"]:
         try:
             __import__(pkg)
         except ImportError:
@@ -1074,7 +1079,7 @@ def send_ping():
     data = json.dumps({"gpu_name": gpu_name, "vram_gb": vram_gb, "has_weights": has_w}).encode("utf-8")
     req = urllib.request.Request(f"{SERVER_URL}/api/worker_ping", data=data, headers={"Content-Type": "application/json"})
     try:
-        urllib.request.urlopen(req, timeout=3)
+        urllib.request.urlopen(req, timeout=15)
     except Exception as e:
         print("Ошибка связи с сервером при ping:", e)
 
@@ -1088,7 +1093,7 @@ def send_log(msg, progress=None, step=None, step_name=None, status=None, has_wei
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(f"{SERVER_URL}/api/worker_log", data=data, headers={"Content-Type": "application/json"})
     try:
-        urllib.request.urlopen(req, timeout=3)
+        urllib.request.urlopen(req, timeout=15)
     except Exception:
         pass
     print(f">> {msg}")
@@ -1343,7 +1348,7 @@ last_handled_tts = None
 while True:
     try:
         send_ping()
-        res = urllib.request.urlopen(f"{SERVER_URL}/api/worker_task", timeout=3)
+        res = urllib.request.urlopen(f"{SERVER_URL}/api/worker_task", timeout=15)
         data = json.loads(res.read().decode("utf-8"))
         if data.get("task") == "start_training":
             try:
